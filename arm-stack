@@ -12,12 +12,36 @@ visualization, filtering capabilities, and better error handling.
 Requirements:
     - ARM GCC toolchain (arm-none-eabi-objdump)
     - Project compiled with -fstack-usage flag
-    - Object files (.o) and stack usage files (.su)
+    - Object files (.o or .c.obj) and stack usage files (.su)
 
 Author: wizath
 GitHub: https://github.com/wizath
 License: MIT
-Version: 1.0
+Version: 1.1
+
+CHANGELOG:
+v1.1 (2024-12-19):
+    - Added support for Zephyr/CMake .c.obj object files
+    - Fixed stack usage file detection for .c.obj -> .c.su mapping
+    - Enhanced object file discovery to handle both .o and .c.obj extensions
+    - Improved error messages to reflect support for both file types
+    - Added JSON export functionality (--export-json)
+    - Added JSON output mode (--json) for direct stdout output
+    - Added short output mode (--short) for simple function list
+    - Added configurable objdump path (--objdump)
+    - Replaced print statements with proper logging system
+    - Improved code formatting and fixed linting issues
+    - Added comparison mode for analyzing changes between builds (--compare)
+    - Implemented git-diff style output for stack usage comparisons
+    - Enhanced analysis data structure with comprehensive metadata
+    - Added support for tracking function additions, removals, and modifications
+    - Improved command-line interface with new export and comparison options
+
+v1.0 (Initial release):
+    - Basic stack usage analysis for ARM embedded projects
+    - Call graph traversal and stack cost calculation
+    - Comprehensive reporting with file-based organization
+    - Symbol resolution and recursion detection
 """
 
 import sys
@@ -25,15 +49,19 @@ import os
 import re
 import subprocess
 import glob
+import json
+import logging
 from collections import defaultdict, namedtuple
-from typing import Dict, Set, List, Optional, Tuple
+from typing import Dict, Set, List, Optional
 import argparse
 from pathlib import Path
+from datetime import datetime
 
 # Version information
-__version__ = "1.0"
+__version__ = "1.1"
 __author__ = "wizath"
 __github__ = "https://github.com/wizath"
+
 
 class Colors:
     """ANSI color codes for enhanced terminal output"""
@@ -47,8 +75,9 @@ class Colors:
     UNDERLINE = '\033[4m'
     END = '\033[0m'
 
+
 # Tool configuration constants
-OBJDUMP = "arm-none-eabi-objdump"
+DEFAULT_OBJDUMP = "arm-none-eabi-objdump"
 CALL_COST = 4  # ARM function call overhead in bytes
 
 # Data structure for function information
@@ -57,14 +86,15 @@ FunctionInfo = namedtuple('FunctionInfo', [
     'cost',         # Total stack cost including callees
     'frame_size',   # Local frame size from .su file
     'height',       # Call chain depth
-    'is_recursive', # Whether function is recursive
+    'is_recursive',  # Whether function is recursive
     'is_root'       # Whether function is a root (entry point)
 ])
+
 
 class StackAnalyzer:
     """
     Main analyzer class for processing ARM object files and calculating stack usage.
-    
+
     This class implements the core algorithm for:
     - Parsing object file disassembly to build call graphs
     - Reading stack usage information from .su files
@@ -72,20 +102,28 @@ class StackAnalyzer:
     - Calculating total stack costs through call graph traversal
     - Generating comprehensive analysis reports
     """
-    
-    def __init__(self, build_dir: str, threshold: int = 10, show_warnings: bool = True):
+
+    def __init__(
+            self,
+            build_dir: str,
+            threshold: int = 10,
+            show_warnings: bool = True,
+            objdump_path: str = DEFAULT_OBJDUMP):
         """
         Initialize the stack analyzer.
-        
+
         Args:
             build_dir: Path to build directory containing object files
             threshold: Minimum stack usage threshold for reporting (bytes)
             show_warnings: Whether to display symbol resolution warnings
+            objdump_path: Path to objdump executable
         """
         self.build_dir = Path(build_dir)
         self.threshold = threshold
         self.show_warnings = show_warnings
-        
+        self.objdump_path = objdump_path
+        self.logger = logging.getLogger(__name__)
+
         # Core data structures for analysis
         self.frame_size: Dict[str, int] = {}  # "func@file" -> frame size in bytes
         self.call_graph: Dict[str, Set[str]] = defaultdict(set)  # "func@file" -> {callees}
@@ -94,7 +132,7 @@ class StackAnalyzer:
         self.visited: Dict[str, str] = {}  # "func@file" -> traversal status
         self.has_caller: Set[str] = set()  # Functions called by others
         self.unresolved: Set[str] = set()  # Unresolved function references
-        
+
         # Symbol resolution tables
         self.addresses: Dict[int, str] = {}  # address -> "func@file"
         self.global_name: Dict[str, str] = {}  # func_name -> "func@file"
@@ -103,20 +141,21 @@ class StackAnalyzer:
     def find_object_files(self) -> List[str]:
         """
         Locate all relevant object files in the build directory.
-        
+
         Filters out CMake compiler identification files and other non-project objects.
-        
+
         Returns:
             List of object file paths
-            
+
         Raises:
             FileNotFoundError: If build directory doesn't exist or no object files found
         """
         if not self.build_dir.exists():
             raise FileNotFoundError(f"Build directory '{self.build_dir}' does not exist")
-        
+
         obj_files = []
-        for pattern in ["**/*.o"]:
+        # Support both .o and .c.obj extensions (Zephyr/CMake uses .c.obj)
+        for pattern in ["**/*.o", "**/*.c.obj"]:
             all_files = glob.glob(str(self.build_dir / pattern), recursive=True)
             # Filter out CMake-generated compiler test files
             for file in all_files:
@@ -124,141 +163,148 @@ class StackAnalyzer:
                     'CompilerIdC', 'CompilerIdCXX', 'CMakeCCompilerId', 'CMakeCXXCompilerId'
                 ]):
                     obj_files.append(file)
-        
+
         if not obj_files:
-            raise FileNotFoundError(f"No relevant object files (.o) found in '{self.build_dir}'")
-        
+            raise FileNotFoundError(f"No relevant object files (.o or .c.obj) found in '{self.build_dir}'")
+
         return sorted(obj_files)
 
     def check_prerequisites(self) -> None:
         """
         Verify that all required tools and files are available for analysis.
-        
+
         Checks for:
         - ARM objdump tool availability
         - Build directory existence
         - Presence of object files and stack usage files
-        
+
         Returns:
             List of object files to process
-            
+
         Raises:
             SystemExit: If prerequisites are not met
         """
-        print(f"{Colors.CYAN}🔍 Checking prerequisites...{Colors.END}")
-        
+        self.logger.info("🔍 Checking prerequisites...")
+
         # Verify ARM toolchain availability
         try:
-            subprocess.run([OBJDUMP, "--version"], capture_output=True, check=True)
-            print(f"  ✓ {OBJDUMP} found")
+            subprocess.run([self.objdump_path, "--version"], capture_output=True, check=True)
+            self.logger.info(f"  ✓ {self.objdump_path} found")
         except (subprocess.CalledProcessError, FileNotFoundError):
-            print(f"{Colors.RED}❌ Error: {OBJDUMP} not found. Please install ARM GCC toolchain.{Colors.END}")
+            print(f"{Colors.RED}❌ Error: {self.objdump_path} not found. Please install ARM GCC toolchain or specify correct path with --objdump.{Colors.END}")
             sys.exit(1)
-        
+
         # Verify build directory
         if not self.build_dir.exists():
             print(f"{Colors.RED}❌ Error: Build directory '{self.build_dir}' does not exist.{Colors.END}")
             print(f"{Colors.YELLOW}💡 Please run cmake and build the project first.{Colors.END}")
             sys.exit(1)
-        
+
         # Locate object files
         obj_files = self.find_object_files()
-        print(f"  ✓ Found {len(obj_files)} object files")
-        
+        self.logger.info(f"  ✓ Found {len(obj_files)} object files")
+
         # Verify stack usage files exist
         su_files = []
         for obj_file in obj_files:
-            su_file = obj_file[:-2] + '.su'
+            # Handle both .o and .c.obj extensions
+            if obj_file.endswith('.o'):
+                su_file = obj_file[:-2] + '.su'
+            elif obj_file.endswith('.c.obj'):
+                su_file = obj_file[:-6] + '.c.su'
+            else:
+                continue
+
             if os.path.exists(su_file):
                 su_files.append(su_file)
-        
+
         if not su_files:
             print(f"{Colors.RED}❌ Error: No stack usage files (.su) found.{Colors.END}")
             print(f"{Colors.YELLOW}💡 Please compile with -fstack-usage flag to generate .su files.{Colors.END}")
             print(f"{Colors.YELLOW}💡 Add '-fstack-usage' to your CMakeLists.txt target_compile_options.{Colors.END}")
             sys.exit(1)
-        
-        print(f"  ✓ Found {len(su_files)} stack usage files (from {len(obj_files)} object files)")
-        
+
+        self.logger.info(f"  ✓ Found {len(su_files)} stack usage files (from {len(obj_files)} object files)")
+
         return obj_files
 
     def parse_object_files(self, obj_files: List[str]) -> None:
         """
         Parse all object files to extract call graph and stack usage information.
-        
+
         For each object file:
         - Disassembles to find function calls and build call graph
         - Reads corresponding .su file for stack frame sizes
-        
+
         Args:
             obj_files: List of object file paths to process
         """
-        print(f"{Colors.CYAN}📁 Parsing {len(obj_files)} object files... ", end="", flush=True)
-        
+        self.logger.info(f"📁 Parsing {len(obj_files)} object files...")
+
         for i, obj_file in enumerate(obj_files, 1):
             # Progress indicator for large projects
-            if i % 10 == 0 or i == len(obj_files):
-                print(f"{i}/{len(obj_files)}", end=" ", flush=True)
-            
+            if i % 50 == 0 or i == len(obj_files):
+                self.logger.debug(f"Progress: {i}/{len(obj_files)} files processed")
+
             self._parse_disassembly(obj_file)
             self._parse_su_file(obj_file)
-        
-        print(f"{Colors.GREEN}✓{Colors.END}")
+
+        self.logger.info("✓ Parsing complete")
 
     def _parse_disassembly(self, obj_file: str) -> None:
         """
         Parse objdump disassembly output to build function call graph.
-        
+
         Extracts:
         - Function definitions and their addresses
         - Function call relationships via relocation entries
         - Symbol address mappings for resolution
-        
+
         Args:
             obj_file: Path to object file to disassemble
-            
+
         Raises:
             SystemExit: If disassembly fails
         """
         try:
-            result = subprocess.run([OBJDUMP, "-dr", obj_file], 
-                                  capture_output=True, text=True, check=True)
-            
+            result = subprocess.run([self.objdump_path, "-dr", obj_file],
+                                    capture_output=True, text=True, check=True)
+
             current_function = None
-            
+
             for line in result.stdout.splitlines():
                 line = line.strip()
-                
+
                 # Match function definition: "00000000 <function_name>:"
                 func_match = re.match(r'^([0-9a-fA-F]+) <(.*)>:', line)
                 if func_match:
                     addr, name = func_match.groups()
                     current_function = f"{name}@{obj_file}"
                     self.call_graph[current_function] = set()
-                    
+
                     # Track ambiguous function names across object files
                     if name in self.global_name:
                         self.ambiguous.add(name)
                     self.global_name[name] = current_function
-                    
+
                     # Store address mapping for symbol resolution
                     addr = addr.lstrip('0') or '0'
                     self.addresses[f"{addr}@{obj_file}"] = current_function
-                
+
                 # Match function call: ": R_ARM_CALL target"
                 call_match = re.search(r': R_[A-Za-z0-9_]+_CALL\s+(.+)', line)
                 if call_match and current_function:
                     target = call_match.group(1)
-                    
+
                     # Handle different call target formats
                     if target == ".text":
                         target = f"@{obj_file}"
                     elif target.startswith(".text+0x"):
                         offset = target[9:]  # Remove ".text+0x" prefix
                         target = f"{offset}@{obj_file}"
-                    
+
                     self.call_graph[current_function].add(target)
-                    
+
         except subprocess.CalledProcessError as e:
             print(f"{Colors.RED}❌ Error disassembling {obj_file}: {e}{Colors.END}")
             sys.exit(1)
@@ -266,20 +312,23 @@ class StackAnalyzer:
     def _parse_su_file(self, obj_file: str) -> None:
         """
         Parse stack usage (.su) file to extract function frame sizes.
-        
+
         The .su file format is: "path:line:column:function_name size qualifier"
         Frame sizes are adjusted by adding the ARM call overhead cost.
-        
+
         Args:
             obj_file: Object file path (corresponding .su file will be located)
         """
-        if not obj_file.endswith('.o'):
+        # Handle both .o and .c.obj extensions
+        if obj_file.endswith('.o'):
+            su_file = obj_file[:-2] + '.su'
+        elif obj_file.endswith('.c.obj'):
+            su_file = obj_file[:-6] + '.c.su'
+        else:
             return
-            
-        su_file = obj_file[:-2] + '.su'
-        
+
         try:
-            with open(su_file, 'r') as f:
+            with open(su_file, 'r', encoding='utf-8') as f:
                 for line in f:
                     # Parse: "/path/file.c:137:20:function_name   size   qualifier"
                     match = re.search(r':([^:\t ]+)[\t ]+([0-9]+)[\t ]+', line)
@@ -287,7 +336,7 @@ class StackAnalyzer:
                         func_name, size = match.groups()
                         # Add ARM function call overhead to frame size
                         self.frame_size[f"{func_name}@{obj_file}"] = int(size) + CALL_COST
-                        
+
         except FileNotFoundError:
             # Stack usage files may not exist for assembly files or system libraries
             pass
@@ -295,21 +344,21 @@ class StackAnalyzer:
     def resolve_symbols(self) -> None:
         """
         Resolve function call targets using symbol tables and address mappings.
-        
+
         This process converts raw call targets (addresses, offsets, names) into
         fully qualified function references that can be used for call graph analysis.
-        
+
         Resolution priority:
         1. Direct address matches
         2. Global symbol name matches
         3. Existing call graph entries
         4. Mark as unresolved
         """
-        print(f"{Colors.CYAN}🔗 Resolving symbols...{Colors.END}")
-        
+        self.logger.info("🔗 Resolving symbols...")
+
         for func_name, callees in self.call_graph.items():
             resolved = set()
-            
+
             for target in callees:
                 if target in self.addresses:
                     # Direct address match
@@ -318,44 +367,44 @@ class StackAnalyzer:
                     # Global symbol name match
                     resolved.add(self.global_name[target])
                     if target in self.ambiguous and self.show_warnings:
-                        print(f"{Colors.YELLOW}⚠️  Ambiguous resolution: {target}{Colors.END}")
+                        self.logger.warning(f"⚠️  Ambiguous resolution: {target}")
                 elif target in self.call_graph:
                     # Already in call graph
                     resolved.add(target)
                 else:
                     # Cannot resolve - likely external library function
                     self.unresolved.add(target)
-            
+
             self.call_graph[func_name] = resolved
 
     def create_interrupt_node(self) -> None:
         """
         Create virtual interrupt node for interrupt service routine analysis.
-        
+
         This creates a synthetic "INTERRUPT" node that calls all interrupt handlers
         (functions matching "__vector_*" pattern). This allows calculation of
         worst-case interrupt stack usage.
         """
         self.call_graph["INTERRUPT"] = set()
-        
+
         for func_name in self.call_graph:
             if "__vector_" in func_name:
                 self.call_graph["INTERRUPT"].add(func_name)
 
-    def trace_call_graph(self) -> None:
+    def trace_call_graph(self, quiet: bool = False) -> None:
         """
         Traverse the call graph to calculate stack costs and call depths.
-        
+
         Uses depth-first traversal with memoization to compute:
         - Total stack cost: frame size + maximum callee cost
         - Call depth: maximum depth of any call path
         - Recursion detection: marks recursive functions
-        
+
         The algorithm handles cycles by detecting when a function is revisited
         during traversal and marking it as recursive.
         """
-        print(f"{Colors.CYAN}📊 Analyzing call graph...{Colors.END}")
-        
+        self.logger.info("📊 Analyzing call graph...")
+
         def trace(func_name: str) -> None:
             """Recursive traversal function with cycle detection"""
             if func_name in self.visited:
@@ -363,34 +412,34 @@ class StackAnalyzer:
                     # Cycle detected - mark as recursive
                     self.visited[func_name] = "R"
                 return
-            
+
             # Mark as currently being processed
             self.visited[func_name] = "?"
-            
+
             max_depth = 0
             max_frame = 0
-            
+
             # Process all callees
             if func_name in self.call_graph:
                 for callee in self.call_graph[func_name]:
                     self.has_caller.add(callee)
                     trace(callee)
-                    
+
                     callee_cost = self.total_cost.get(callee, 0)
                     callee_depth = self.call_depth.get(callee, 0)
-                    
+
                     # Track maximum cost and depth among callees
                     max_frame = max(max_frame, callee_cost)
                     max_depth = max(max_depth, callee_depth)
-            
+
             # Calculate final values
             self.call_depth[func_name] = max_depth + 1
             self.total_cost[func_name] = max_frame + self.frame_size.get(func_name, 0)
-            
+
             # Mark as completed (if not recursive)
             if self.visited[func_name] == "?":
                 self.visited[func_name] = " "
-        
+
         # Process all functions in the call graph
         for func_name in self.call_graph:
             trace(func_name)
@@ -398,7 +447,7 @@ class StackAnalyzer:
     def generate_report(self) -> None:
         """
         Generate and display comprehensive stack usage analysis report.
-        
+
         The report includes:
         - File-based stack usage summary
         - Detailed function table with costs and depths
@@ -408,45 +457,45 @@ class StackAnalyzer:
         print(f"\n{Colors.BOLD}{Colors.HEADER}{'='*80}{Colors.END}")
         print(f"{Colors.BOLD}{Colors.HEADER}📈 STACK USAGE ANALYSIS REPORT{Colors.END}")
         print(f"{Colors.BOLD}{Colors.HEADER}{'='*80}{Colors.END}\n")
-        
+
         # Prepare function data and file statistics
         functions = []
         file_stats = defaultdict(lambda: {'count': 0, 'total_cost': 0, 'max_cost': 0, 'functions': []})
         max_iv_cost = 0
         main_cost = 0
-        
-        for func_full_name in sorted(self.total_cost.keys(), 
-                                   key=lambda x: self.total_cost[x], reverse=True):
-            
+
+        for func_full_name in sorted(self.total_cost.keys(),
+                                     key=lambda x: self.total_cost[x], reverse=True):
+
             # Extract clean function name and source file
             display_name = func_full_name
             source_file = "unknown"
-            
+
             if '@' in func_full_name:
                 base_name = func_full_name.split('@')[0]
                 obj_file = func_full_name.split('@')[1]
-                
+
                 # Extract source file name from object file path
                 if '/' in obj_file:
                     source_file = os.path.basename(obj_file).replace('.o', '')
                 else:
                     source_file = obj_file.replace('.o', '')
-                
+
                 # Use clean name if not ambiguous
                 if base_name not in self.ambiguous:
                     display_name = base_name
-            
+
             # Determine function characteristics
             is_recursive = self.visited.get(func_full_name, ' ') == 'R'
             is_root = func_full_name not in self.has_caller
             cost = self.total_cost[func_full_name]
-            
+
             # Track special functions for summary
             if "__vector_" in func_full_name:
                 max_iv_cost = max(max_iv_cost, cost)
             elif func_full_name.startswith("main@"):
                 main_cost = cost
-            
+
             func_info = FunctionInfo(
                 name=display_name,
                 cost=cost,
@@ -455,43 +504,200 @@ class StackAnalyzer:
                 is_recursive=is_recursive,
                 is_root=is_root
             )
-            
+
             functions.append(func_info)
-            
+
             # Update file statistics
             if cost > 0:
                 file_stats[source_file]['count'] += 1
                 file_stats[source_file]['total_cost'] += cost
                 file_stats[source_file]['max_cost'] = max(file_stats[source_file]['max_cost'], cost)
                 file_stats[source_file]['functions'].append((display_name, cost, is_root))
-        
+
         # Generate report sections
         self._print_file_hierarchy(file_stats)
         self._print_function_table(functions)
         self._print_summary(main_cost, max_iv_cost)
         self._print_unresolved()
 
+        # Return data for potential JSON export
+        return self._build_analysis_data(functions, file_stats, main_cost, max_iv_cost)
+
+    def generate_analysis_data(self) -> Dict:
+        """
+        Generate analysis data without printing report (for JSON mode).
+
+        Returns:
+            Analysis data dictionary
+        """
+        # Prepare function data and file statistics (same logic as generate_report)
+        functions = []
+        file_stats = defaultdict(lambda: {'count': 0, 'total_cost': 0, 'max_cost': 0, 'functions': []})
+        max_iv_cost = 0
+        main_cost = 0
+
+        for func_full_name in sorted(self.total_cost.keys(),
+                                     key=lambda x: self.total_cost[x], reverse=True):
+
+            # Extract clean function name and source file
+            display_name = func_full_name
+            source_file = "unknown"
+
+            if '@' in func_full_name:
+                base_name = func_full_name.split('@')[0]
+                obj_file = func_full_name.split('@')[1]
+
+                # Extract source file name from object file path
+                if '/' in obj_file:
+                    source_file = os.path.basename(obj_file).replace('.o', '').replace('.c.obj', '.cbj')
+                else:
+                    source_file = obj_file.replace('.o', '').replace('.c.obj', '.cbj')
+
+                # Use clean name if not ambiguous
+                if base_name not in self.ambiguous:
+                    display_name = base_name
+
+            # Determine function characteristics
+            is_recursive = self.visited.get(func_full_name, ' ') == 'R'
+            is_root = func_full_name not in self.has_caller
+            cost = self.total_cost[func_full_name]
+
+            # Track special functions for summary
+            if "__vector_" in func_full_name:
+                max_iv_cost = max(max_iv_cost, cost)
+            elif func_full_name.startswith("main@"):
+                main_cost = cost
+
+            func_info = FunctionInfo(
+                name=display_name,
+                cost=cost,
+                frame_size=self.frame_size.get(func_full_name, 0),
+                height=self.call_depth.get(func_full_name, 0),
+                is_recursive=is_recursive,
+                is_root=is_root
+            )
+
+            functions.append(func_info)
+
+            # Update file statistics
+            if cost > 0:
+                file_stats[source_file]['count'] += 1
+                file_stats[source_file]['total_cost'] += cost
+                file_stats[source_file]['max_cost'] = max(file_stats[source_file]['max_cost'], cost)
+                file_stats[source_file]['functions'].append((display_name, cost, is_root))
+
+        return self._build_analysis_data(functions, file_stats, main_cost, max_iv_cost)
+
+    def generate_short_report(self) -> None:
+        """
+        Generate a short report with only function names and stack usage.
+
+        Outputs a simple sorted list of functions with their stack costs.
+        """
+        # Collect functions with their costs
+        function_costs = []
+
+        for func_full_name in self.total_cost.keys():
+            cost = self.total_cost[func_full_name]
+            if cost >= self.threshold:
+                # Extract clean function name
+                display_name = func_full_name
+                if '@' in func_full_name:
+                    base_name = func_full_name.split('@')[0]
+                    # Use clean name if not ambiguous
+                    if base_name not in self.ambiguous:
+                        display_name = base_name
+
+                function_costs.append((display_name, cost))
+
+        # Sort by cost (descending)
+        function_costs.sort(key=lambda x: x[1], reverse=True)
+
+        # Output the list
+        for func_name, cost in function_costs:
+            print(f"{func_name}: {cost}")
+
+    def _build_analysis_data(
+            self,
+            functions: List[FunctionInfo],
+            file_stats: Dict,
+            main_cost: int,
+            max_iv_cost: int) -> Dict:
+        """
+        Build the analysis data dictionary.
+
+        Args:
+            functions: List of function information
+            file_stats: File statistics dictionary
+            main_cost: Main function cost
+            max_iv_cost: Maximum interrupt cost
+
+        Returns:
+            Analysis data dictionary
+        """
+        return {
+            'metadata': {
+                'timestamp': datetime.now().isoformat(),
+                'build_dir': str(self.build_dir),
+                'threshold': self.threshold,
+                'total_functions': len(functions),
+                'functions_analyzed': len([f for f in functions if f.cost > 0])
+            },
+            'summary': {
+                'main_cost': main_cost,
+                'max_interrupt_cost': max_iv_cost,
+                'total_peak_estimate': main_cost + max_iv_cost,
+                'max_single_function': max((f.cost for f in functions), default=0),
+                'average_stack_usage': sum(f.cost for f in functions) // len(functions) if functions else 0
+            },
+            'functions': [
+                {
+                    'name': func.name,
+                    'total_cost': func.cost,
+                    'frame_size': func.frame_size,
+                    'call_depth': func.height,
+                    'is_recursive': func.is_recursive,
+                    'is_root': func.is_root
+                }
+                for func in functions if func.cost > 0
+            ],
+            'files': {
+                filename: {
+                    'function_count': stats['count'],
+                    'total_cost': stats['total_cost'],
+                    'max_cost': stats['max_cost'],
+                    'functions': [
+                        {'name': name, 'cost': cost, 'is_root': is_root}
+                        for name, cost, is_root in stats['functions']
+                    ]
+                }
+                for filename, stats in file_stats.items()
+                if stats['total_cost'] > 0
+            },
+            'unresolved': sorted(list(self.unresolved))
+        }
+
     def _print_file_hierarchy(self, file_stats: Dict) -> None:
         """
         Display stack usage organized by source file.
-        
+
         Shows top functions per file and total usage statistics.
-        
+
         Args:
             file_stats: Dictionary mapping filenames to usage statistics
         """
         print(f"{Colors.BOLD}📁 Stack Usage by Source File{Colors.END}\n")
-        
+
         # Sort files by total stack usage (descending)
-        sorted_files = sorted(file_stats.items(), 
-                            key=lambda x: x[1]['total_cost'], reverse=True)
-        
+        sorted_files = sorted(file_stats.items(),
+                              key=lambda x: x[1]['total_cost'], reverse=True)
+
         # Display files with non-zero stack usage
         for filename, stats in sorted_files:
             if stats['total_cost'] > 0:
                 # Show top 3 functions per file
                 top_funcs = sorted(stats['functions'], key=lambda x: x[1], reverse=True)[:3]
-                
+
                 print(f"{filename}")
                 for name, cost, is_root in top_funcs:
                     print(f"  - {name} ({cost} bytes)")
@@ -500,48 +706,49 @@ class StackAnalyzer:
     def _print_function_table(self, functions: List[FunctionInfo]) -> None:
         """
         Display detailed function stack usage table.
-        
+
         Shows functions above the threshold with their costs, frame sizes,
         and call depths. Functions are sorted by total cost (descending).
-        
+
         Args:
             functions: List of function information objects
         """
         # Apply threshold filter
         filtered_functions = [f for f in functions if f.cost >= self.threshold]
-        
+
         if not filtered_functions:
             print(f"{Colors.YELLOW}⚠️  No functions with significant stack usage found{Colors.END}")
             return
-        
+
         print(f"{Colors.BOLD}📋 Function Stack Usage Analysis{Colors.END}")
         print(f"{Colors.CYAN}   (Showing {len(filtered_functions)} functions with stack usage ≥{self.threshold} bytes){Colors.END}")
         print(f"{Colors.CYAN}   Total = Frame + Max(Callees), Frame = Local variables, Depth = Call chain length{Colors.END}\n")
-        
+
         # Table header with proper alignment
         print(f"{Colors.BOLD}{Colors.UNDERLINE}{'Flag':<5}{'Function Name':<40} {'Total':<7} {'Frame':<7} {'Depth':<5}{Colors.END}")
         print(f"{Colors.BOLD}{Colors.UNDERLINE}{'─────':<5}{'────────────────────────────────────────':<40} {'─────':<7} {'─────':<7} {'─────':<5}{Colors.END}")
-        
+
         # Display function rows
         for func in filtered_functions:
             self._print_function_row(func, Colors.END)
-        
+
         # Summary information
         very_low_cost = len([f for f in functions if f.cost < self.threshold and f.cost > 0])
         if very_low_cost > 0:
             print(f"\n{Colors.CYAN}💭 {very_low_cost} functions with very low cost (<{self.threshold} bytes) hidden for clarity{Colors.END}")
-        
-        print(f"\n{Colors.BOLD}📊 Displayed {len(filtered_functions)} of {len([f for f in functions if f.cost > 0])} functions with stack usage{Colors.END}")
+
+        print(
+            f"\n{Colors.BOLD}📊 Displayed {len(filtered_functions)} of {len([f for f in functions if f.cost > 0])} functions with stack usage{Colors.END}")
 
     def _print_function_row(self, func: FunctionInfo, color: str) -> None:
         """
         Print a single function row in the analysis table.
-        
+
         Uses consistent formatting with visual indicators for function types:
         - ▶ for root functions (entry points)
         - 🔄 for recursive functions
         - Color coding based on stack cost
-        
+
         Args:
             func: Function information object
             color: Base color for the row
@@ -553,7 +760,7 @@ class StackAnalyzer:
             flag = f"{Colors.GREEN}▶{Colors.END}   "  # Root function
         else:
             flag = "     "  # Regular function
-        
+
         # Apply cost-based color coding
         cost_color = Colors.END
         if func.cost >= 500:
@@ -566,41 +773,41 @@ class StackAnalyzer:
             cost_color = f"{Colors.CYAN}"
         else:
             cost_color = Colors.END
-        
+
         # Handle long function names
         display_name = func.name
         if len(display_name) > 39:
             display_name = display_name[:36] + "..."
-        
+
         # Print formatted row with consistent alignment
         print(f"{flag}{display_name:<40} {cost_color}{func.cost:<7}{Colors.END} {func.frame_size:<7} {func.height:<5}")
 
     def _print_summary(self, main_cost: int, max_iv_cost: int) -> None:
         """
         Display analysis summary with peak stack usage estimates.
-        
+
         Provides estimates for:
         - Main execution path stack usage
         - Worst-case interrupt handler stack usage
         - Combined peak usage estimate
         - General statistics
-        
+
         Args:
             main_cost: Stack cost of main function
             max_iv_cost: Maximum interrupt handler cost
         """
         print(f"\n{Colors.BOLD}{Colors.HEADER}📊 ANALYSIS SUMMARY{Colors.END}")
         print("─" * 50)
-        
+
         interrupt_cost = self.total_cost.get("INTERRUPT", 0)
         total_peak = main_cost + max_iv_cost
-        
+
         print(f"🎯 Peak execution estimate:")
         print(f"   Main function cost:     {Colors.CYAN}{main_cost:>6}{Colors.END} bytes")
         print(f"   Worst interrupt cost:   {Colors.YELLOW}{max_iv_cost:>6}{Colors.END} bytes")
         print(f"   Virtual interrupt node: {Colors.BLUE}{interrupt_cost:>6}{Colors.END} bytes")
         print(f"   {Colors.BOLD}Total estimated peak:   {Colors.GREEN}{total_peak:>6}{Colors.END}{Colors.BOLD} bytes{Colors.END}")
-        
+
         # Additional statistics
         all_costs = list(self.total_cost.values())
         if all_costs:
@@ -612,7 +819,7 @@ class StackAnalyzer:
     def _print_unresolved(self) -> None:
         """
         Display list of unresolved function references.
-        
+
         These are typically external library functions or system calls
         that don't have corresponding object files in the build directory.
         """
@@ -620,7 +827,7 @@ class StackAnalyzer:
             print(f"\n{Colors.YELLOW}{Colors.BOLD}⚠️  UNRESOLVED FUNCTIONS{Colors.END}")
             print("─" * 30)
             print(f"{Colors.YELLOW}The following functions could not be resolved:{Colors.END}")
-            
+
             # Display limited list to avoid overwhelming output
             sorted_unresolved = sorted(self.unresolved)
             for i, func in enumerate(sorted_unresolved):
@@ -630,10 +837,172 @@ class StackAnalyzer:
                     print(f"   • ... and {len(sorted_unresolved) - 20} more")
                     break
 
+    def export_json(self, output_file: str, data: Dict) -> None:
+        """
+        Export analysis data to JSON format.
+
+        Args:
+            output_file: Path to output JSON file
+            data: Analysis data dictionary to export
+        """
+        try:
+            with open(output_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, sort_keys=True)
+            print(f"\n{Colors.GREEN}✓ Analysis data exported to {output_file}{Colors.END}")
+        except Exception as e:
+            print(f"{Colors.RED}❌ Error exporting JSON: {e}{Colors.END}")
+
+
+def load_json_data(file_path: str) -> Optional[Dict]:
+    """
+    Load analysis data from JSON file.
+
+    Args:
+        file_path: Path to JSON file
+
+    Returns:
+        Analysis data dictionary or None if failed
+    """
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"{Colors.RED}❌ Error loading {file_path}: {e}{Colors.END}")
+        return None
+
+
+def compare_analyses(old_data: Dict, new_data: Dict) -> None:
+    """
+    Compare two stack analysis results and display git-diff like output.
+
+    Args:
+        old_data: Previous analysis data
+        new_data: Current analysis data
+    """
+    print(f"\n{Colors.BOLD}{Colors.HEADER}{'='*80}{Colors.END}")
+    print(f"{Colors.BOLD}{Colors.HEADER}📊 STACK USAGE COMPARISON{Colors.END}")
+    print(f"{Colors.BOLD}{Colors.HEADER}{'='*80}{Colors.END}\n")
+
+    # Compare metadata
+    old_time = old_data.get('metadata', {}).get('timestamp', 'unknown')
+    new_time = new_data.get('metadata', {}).get('timestamp', 'unknown')
+    print(f"{Colors.CYAN}Comparing:{Colors.END}")
+    print(f"  Old: {old_time}")
+    print(f"  New: {new_time}")
+
+    # Compare summary statistics
+    old_summary = old_data.get('summary', {})
+    new_summary = new_data.get('summary', {})
+
+    print(f"\n{Colors.BOLD}📈 Summary Changes:{Colors.END}")
+    _print_summary_diff('Peak estimate', old_summary.get('total_peak_estimate', 0),
+                        new_summary.get('total_peak_estimate', 0))
+    _print_summary_diff('Max single function', old_summary.get('max_single_function', 0),
+                        new_summary.get('max_single_function', 0))
+    _print_summary_diff('Average usage', old_summary.get('average_stack_usage', 0),
+                        new_summary.get('average_stack_usage', 0))
+
+    # Compare functions
+    old_functions = {f['name']: f for f in old_data.get('functions', [])}
+    new_functions = {f['name']: f for f in new_data.get('functions', [])}
+
+    all_functions = set(old_functions.keys()) | set(new_functions.keys())
+    changes = []
+
+    for func_name in sorted(all_functions):
+        old_func = old_functions.get(func_name)
+        new_func = new_functions.get(func_name)
+
+        if old_func and new_func:
+            old_cost = old_func['total_cost']
+            new_cost = new_func['total_cost']
+            if old_cost != new_cost:
+                diff = new_cost - old_cost
+                changes.append((func_name, old_cost, new_cost, diff, 'modified'))
+        elif old_func and not new_func:
+            changes.append((func_name, old_func['total_cost'], 0, -old_func['total_cost'], 'removed'))
+        elif not old_func and new_func:
+            changes.append((func_name, 0, new_func['total_cost'], new_func['total_cost'], 'added'))
+
+    if changes:
+        print(f"\n{Colors.BOLD}🔄 Function Changes:{Colors.END}")
+        print(f"{Colors.BOLD}{Colors.UNDERLINE}{'Status':<8} {'Function Name':<40} {'Old':<7} {'New':<7} {'Diff':<8}{Colors.END}")
+        print(f"{Colors.BOLD}{Colors.UNDERLINE}{'────────':<8} {'────────────────────────────────────────':<40} {'───':<7} {'───':<7} {'────────':<8}{Colors.END}")
+
+        # Sort by absolute difference (largest changes first)
+        changes.sort(key=lambda x: abs(x[3]), reverse=True)
+
+        for func_name, old_cost, new_cost, diff, status in changes[:20]:  # Show top 20 changes
+            _print_function_diff(func_name, old_cost, new_cost, diff, status)
+
+        if len(changes) > 20:
+            print(f"\n{Colors.CYAN}💭 {len(changes) - 20} more changes not shown{Colors.END}")
+    else:
+        print(f"\n{Colors.GREEN}✓ No function-level changes detected{Colors.END}")
+
+    # Compare file statistics
+    old_files = old_data.get('files', {})
+    new_files = new_data.get('files', {})
+
+    file_changes = []
+    all_files = set(old_files.keys()) | set(new_files.keys())
+
+    for file_name in sorted(all_files):
+        old_file = old_files.get(file_name, {})
+        new_file = new_files.get(file_name, {})
+
+        old_total = old_file.get('total_cost', 0)
+        new_total = new_file.get('total_cost', 0)
+
+        if old_total != new_total:
+            diff = new_total - old_total
+            file_changes.append((file_name, old_total, new_total, diff))
+
+    if file_changes:
+        print(f"\n{Colors.BOLD}📁 File-level Changes:{Colors.END}")
+        file_changes.sort(key=lambda x: abs(x[3]), reverse=True)
+
+        for file_name, old_total, new_total, diff in file_changes[:10]:
+            _print_file_diff(file_name, old_total, new_total, diff)
+
+
+def _print_summary_diff(label: str, old_val: int, new_val: int) -> None:
+    """Print a summary statistic difference."""
+    diff = new_val - old_val
+    if diff == 0:
+        print(f"  {label:<20}: {new_val:>6} bytes (no change)")
+    else:
+        color = Colors.RED if diff > 0 else Colors.GREEN
+        sign = '+' if diff > 0 else ''
+        print(f"  {label:<20}: {old_val:>6} → {color}{new_val:>6}{Colors.END} bytes ({color}{sign}{diff:>+6}{Colors.END})")
+
+
+def _print_function_diff(func_name: str, old_cost: int, new_cost: int, diff: int, status: str) -> None:
+    """Print a function difference in git-diff style."""
+    # Truncate long function names
+    display_name = func_name[:39] + "..." if len(func_name) > 39 else func_name
+
+    if status == 'added':
+        print(f"{Colors.GREEN}+ ADD   {Colors.END} {display_name:<40} {'-':<7} {new_cost:<7} {Colors.GREEN}+{diff:<7}{Colors.END}")
+    elif status == 'removed':
+        print(f"{Colors.RED}- DEL   {Colors.END} {display_name:<40} {old_cost:<7} {'-':<7} {Colors.RED}{diff:<8}{Colors.END}")
+    else:  # modified
+        color = Colors.RED if diff > 0 else Colors.GREEN
+        sign = '+' if diff > 0 else ''
+        print(f"{color}~ MOD   {Colors.END} {display_name:<40} {old_cost:<7} {new_cost:<7} {color}{sign}{diff:<7}{Colors.END}")
+
+
+def _print_file_diff(file_name: str, old_total: int, new_total: int, diff: int) -> None:
+    """Print a file-level difference."""
+    color = Colors.RED if diff > 0 else Colors.GREEN
+    sign = '+' if diff > 0 else ''
+    print(f"  {file_name:<30}: {old_total:>6} → {color}{new_total:>6}{Colors.END} bytes ({color}{sign}{diff:>+6}{Colors.END})")
+
+
 def main():
     """
     Main entry point for the stack analyzer tool.
-    
+
     Handles command line argument parsing, tool initialization,
     and orchestrates the complete analysis workflow.
     """
@@ -642,53 +1011,126 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python3 stack_analyzer.py build
-  python3 stack_analyzer.py cmake-build-debug
-  python3 stack_analyzer.py build --threshold 50
-  python3 stack_analyzer.py build --no-color
-  python3 stack_analyzer.py build --no-warnings
+  python3 arm-stack build
+  python3 arm-stack cmake-build-debug
+  python3 arm-stack build --threshold 50
+  python3 arm-stack build --no-color
+  python3 arm-stack build --no-warnings
+  python3 arm-stack build --export-json stack_usage.json
+  python3 arm-stack build --json > stack_usage.json
+  python3 arm-stack build --short
+  python3 arm-stack build --objdump /path/to/arm-none-eabi-objdump
+  python3 arm-stack --compare old.json new.json
         """
     )
-    parser.add_argument('build_dir', help='Build directory containing object files')
-    parser.add_argument('--threshold', type=int, default=10, 
-                       help='Minimum stack usage threshold in bytes (default: 10)')
+    parser.add_argument('build_dir', nargs='?', help='Build directory containing object files')
+    parser.add_argument('--threshold', type=int, default=10,
+                        help='Minimum stack usage threshold in bytes (default: 10)')
     parser.add_argument('--no-color', action='store_true', help='Disable colored output')
     parser.add_argument('--no-warnings', action='store_true', help='Suppress warning messages')
+    parser.add_argument('--export-json', type=str, metavar='FILE',
+                        help='Export analysis data to JSON file')
+    parser.add_argument('--json', action='store_true',
+                        help='Output analysis results in JSON format to stdout')
+    parser.add_argument('--short', action='store_true',
+                        help='Output only a sorted list of functions with stack usage')
+    parser.add_argument('--objdump', type=str, default=DEFAULT_OBJDUMP, metavar='PATH',
+                        help=f'Path to objdump executable (default: {DEFAULT_OBJDUMP})')
+    parser.add_argument('--compare', type=str, nargs=2, metavar=('OLD', 'NEW'),
+                        help='Compare two JSON analysis files')
     parser.add_argument('--version', action='version', version=f'%(prog)s {__version__} by {__author__} ({__github__})')
-    
+
     args = parser.parse_args()
+
+    # Configure logging
+    if args.json or args.short:
+        # Quiet modes: only show errors
+        log_level = logging.ERROR
+        log_stream = sys.stderr
+    elif args.no_warnings:
+        # No warnings: show info but not warnings
+        log_level = logging.INFO
+        log_stream = sys.stdout
+    else:
+        # Normal mode: show info and warnings
+        log_level = logging.INFO
+        log_stream = sys.stdout
     
+    logging.basicConfig(
+        level=log_level,
+        format='%(message)s',
+        stream=log_stream,
+        force=True
+    )
+
     # Configure output formatting
-    if args.no_color:
+    if args.no_color or args.json or args.short:
         for attr in dir(Colors):
             if not attr.startswith('_'):
                 setattr(Colors, attr, '')
-    
-    # Display tool header
-    print(f"{Colors.BOLD}{Colors.HEADER}🔍 ARM Stack Usage Analyzer{Colors.END}")
-    print(f"{Colors.CYAN}Build directory: {args.build_dir}{Colors.END}")
-    if args.threshold != 10:
-        print(f"{Colors.CYAN}Threshold: {args.threshold} bytes{Colors.END}")
-    if args.no_warnings:
-        print(f"{Colors.CYAN}Warnings: disabled{Colors.END}")
-    print()
-    
+
+    # Handle comparison mode
+    if args.compare:
+        old_file, new_file = args.compare
+        print(f"{Colors.BOLD}{Colors.HEADER}🔍 ARM Stack Usage Analyzer - Comparison Mode{Colors.END}")
+        print(f"{Colors.CYAN}Comparing: {old_file} vs {new_file}{Colors.END}")
+
+        old_data = load_json_data(old_file)
+        new_data = load_json_data(new_file)
+
+        if old_data and new_data:
+            compare_analyses(old_data, new_data)
+        else:
+            print(f"{Colors.RED}❌ Failed to load comparison files{Colors.END}")
+            sys.exit(1)
+        return
+
+    # Require build directory for analysis mode
+    if not args.build_dir:
+        parser.error("build_dir is required unless using --compare")
+
+    # Display tool header (unless in JSON or short mode)
+    if not args.json and not args.short:
+        print(f"{Colors.BOLD}{Colors.HEADER}🔍 ARM Stack Usage Analyzer{Colors.END}")
+        print(f"{Colors.CYAN}Build directory: {args.build_dir}{Colors.END}")
+        if args.threshold != 10:
+            print(f"{Colors.CYAN}Threshold: {args.threshold} bytes{Colors.END}")
+        if args.no_warnings:
+            print(f"{Colors.CYAN}Warnings: disabled{Colors.END}")
+        if args.export_json:
+            print(f"{Colors.CYAN}JSON export: {args.export_json}{Colors.END}")
+        if args.objdump != DEFAULT_OBJDUMP:
+            print(f"{Colors.CYAN}Objdump: {args.objdump}{Colors.END}")
+        print()
+
     # Initialize and run analysis
-    analyzer = StackAnalyzer(args.build_dir, args.threshold, not args.no_warnings)
-    
+    analyzer = StackAnalyzer(args.build_dir, args.threshold, not args.no_warnings, args.objdump)
+
     try:
         # Verification and setup phase
         obj_files = analyzer.check_prerequisites()
-        
-        print(f"\n{Colors.CYAN}Analyzing {len(obj_files)} object files...{Colors.END}")
-        
+
         # Analysis workflow
         analyzer.parse_object_files(obj_files)
         analyzer.resolve_symbols()
         analyzer.create_interrupt_node()
         analyzer.trace_call_graph()
-        analyzer.generate_report()
-        
+
+        if args.json:
+            # JSON mode: generate data and output to stdout
+            analysis_data = analyzer.generate_analysis_data()
+            print(json.dumps(analysis_data, indent=2, sort_keys=True))
+        elif args.short:
+            # Short mode: output only function list
+            analyzer.generate_short_report()
+        else:
+            # Normal mode: generate report
+            analysis_data = analyzer.generate_report()
+
+            # Export to JSON if requested
+            if args.export_json:
+                analyzer.export_json(args.export_json, analysis_data)
+
     except KeyboardInterrupt:
         print(f"\n{Colors.YELLOW}⚠️  Analysis interrupted by user{Colors.END}")
         sys.exit(1)
@@ -696,5 +1138,6 @@ Examples:
         print(f"{Colors.RED}❌ Error during analysis: {e}{Colors.END}")
         sys.exit(1)
 
+
 if __name__ == "__main__":
-    main() 
+    main()

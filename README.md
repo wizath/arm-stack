@@ -11,6 +11,10 @@ A comprehensive tool for analyzing stack usage in ARM embedded projects. This Py
 - **Peak Usage Estimation**: Calculates worst-case stack usage scenarios including interrupt handling
 - **Symbol Resolution**: Handles complex symbol resolution across multiple object files
 - **Professional Output**: Clean, readable reports suitable for documentation and code reviews
+- **JSON Export**: Export analysis data to JSON format for automation and CI/CD integration
+- **Comparison Mode**: Compare stack usage between different builds with git-diff style output
+- **Multiple Output Formats**: Standard report, JSON output, or short function list
+- **Zephyr/CMake Support**: Handles both `.o` and `.c.obj` object file formats
 
 ## Requirements
 
@@ -34,13 +38,40 @@ CFLAGS += -fstack-usage
 
 ## Installation
 
+### Option 1: Install via pip (Recommended)
+
+```bash
+pip install arm-stack-analyzer
+```
+
+After installation, the `arm-stack` command will be available globally:
+
+```bash
+arm-stack --version
+arm-stack build/
+```
+
+### Option 2: Install from source
+
+```bash
+git clone https://github.com/wizath/arm-stack.git
+cd arm-stack
+pip install .
+```
+
+### Option 3: Direct script usage
+
 1. Clone or download the `arm-stack` script
 2. Ensure Python 3.6+ is installed
 3. Make the script executable: `chmod +x arm-stack`
-4. Verify ARM toolchain is available:
-   ```bash
-   arm-none-eabi-objdump --version
-   ```
+4. Run directly: `./arm-stack build/`
+
+### Prerequisites
+
+Verify ARM toolchain is available:
+```bash
+arm-none-eabi-objdump --version
+```
 
 ## Usage
 
@@ -52,19 +83,34 @@ CFLAGS += -fstack-usage
 ### Advanced Options
 ```bash
 # Set custom threshold (default: 10 bytes)
-./arm-stack build --threshold 50
+arm-stack build --threshold 50
 
 # Disable colored output
-./arm-stack build --no-color
+arm-stack build --no-color
 
 # Suppress symbol resolution warnings
-./arm-stack build --no-warnings
+arm-stack build --no-warnings
+
+# Export analysis data to JSON file
+arm-stack build --export-json analysis.json
+
+# Output JSON to stdout (for automation)
+arm-stack build --json > analysis.json
+
+# Short output mode (function list only)
+arm-stack build --short
+
+# Compare two analysis files
+arm-stack --compare old_analysis.json new_analysis.json
+
+# Custom objdump path
+arm-stack build --objdump /path/to/arm-none-eabi-objdump
 
 # Show version information
-./arm-stack --version
+arm-stack --version
 
 # Combine options
-./arm-stack cmake-build-debug --threshold 100 --no-warnings
+arm-stack cmake-build-debug --threshold 100 --no-warnings --export-json results.json
 ```
 
 ### Command Line Options
@@ -75,6 +121,11 @@ CFLAGS += -fstack-usage
 | `--threshold N` | Minimum stack usage threshold in bytes | 10 |
 | `--no-color` | Disable colored output | False |
 | `--no-warnings` | Suppress warning messages | False |
+| `--export-json FILE` | Export analysis data to JSON file | None |
+| `--json` | Output JSON to stdout | False |
+| `--short` | Output only function list with stack usage | False |
+| `--objdump PATH` | Path to objdump executable | arm-none-eabi-objdump |
+| `--compare OLD NEW` | Compare two JSON analysis files | None |
 
 ## Output Format
 
@@ -124,6 +175,46 @@ Statistics:
    Maximum single function:   1024 bytes
 ```
 
+## Advanced Features
+
+### JSON Export and Automation
+
+Export analysis data for automation, CI/CD integration, or further processing:
+
+```bash
+# Export to JSON file
+arm-stack build --export-json analysis.json
+
+# Output JSON to stdout (for piping)
+arm-stack build --json | jq '.summary.total_peak_estimate'
+
+# Short format for simple automation
+arm-stack build --short | grep "main:"
+```
+
+The JSON output includes comprehensive metadata, function details, file statistics, and summary information suitable for automated analysis.
+
+### Build Comparison
+
+Track stack usage changes between builds:
+
+```bash
+# Analyze current build
+arm-stack build --export-json current.json
+
+# After code changes, analyze again
+arm-stack build --export-json updated.json
+
+# Compare the results
+arm-stack --compare current.json updated.json
+```
+
+The comparison output shows:
+- Summary statistic changes (peak usage, averages)
+- Function-level changes (added/removed/modified)
+- File-level aggregated changes
+- Git-diff style color-coded output
+
 ## Algorithm Details
 
 ### Call Graph Construction
@@ -170,9 +261,11 @@ Statistics:
 ### Debug Tips
 
 1. **Verify Prerequisites**: Run with verbose output to see file discovery
-2. **Check Object Files**: Ensure `.o` files exist and contain symbols
-3. **Validate .su Files**: Check that `.su` files are generated and contain data
-4. **Test with Lower Threshold**: Use `./arm-stack build --threshold 1` to see all functions
+2. **Check Object Files**: Ensure `.o` or `.c.obj` files exist and contain symbols
+3. **Validate .su Files**: Check that `.su` or `.c.su` files are generated and contain data
+4. **Test with Lower Threshold**: Use `arm-stack build --threshold 1` to see all functions
+5. **Use JSON Export**: Export data with `--export-json` for detailed analysis
+6. **Compare Builds**: Use `--compare` to track changes between builds
 
 ## Comparison with avstack.pl
 
@@ -187,15 +280,30 @@ This tool is inspired by the original `avstack.pl` but provides several enhancem
 | Error Handling | Basic | Comprehensive validation |
 | Visualization | Minimal | Enhanced with icons/colors |
 | Extensibility | Limited | Modular Python design |
+| JSON Export | No | Yes |
+| Comparison Mode | No | Yes |
+| Build System Support | Basic | Zephyr/CMake support |
+| Installation | Manual | pip installable |
 
 ## Contributing
 
 Contributions are welcome! Areas for improvement:
-- Additional output formats (JSON, CSV, HTML)
-- Integration with build systems
-- Enhanced visualization options
-- Support for other architectures
+- Additional output formats (CSV, HTML, XML)
+- Enhanced visualization options (graphs, charts)
+- Support for other architectures (RISC-V, x86)
 - Performance optimizations for large projects
+- IDE integrations and plugins
+- Web-based analysis dashboard
+
+### Development Setup
+
+```bash
+git clone https://github.com/wizath/arm-stack.git
+cd arm-stack
+pip install -e .[dev]
+```
+
+This installs the package in development mode with additional tools for testing and linting.
 
 ## License
 

@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arm-stack-analyzer"
+dynamic = ["version"]
+description = "A comprehensive tool for analyzing stack usage in ARM embedded projects"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "wizath"},
+]
+keywords = ["arm", "embedded", "stack", "analysis", "memory", "firmware", "objdump"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Embedded Systems",
+    "Topic :: Software Development :: Debuggers",
+    "Topic :: System :: Hardware",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.6",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+    "Environment :: Console",
+]
+requires-python = ">=3.6"
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=6.0",
+    "black>=21.0",
+    "flake8>=3.8",
+    "mypy>=0.800",
+]
+
+[project.urls]
+Homepage = "https://github.com/wizath/arm-stack"
+Repository = "https://github.com/wizath/arm-stack"
+"Bug Reports" = "https://github.com/wizath/arm-stack/issues"
+Changelog = "https://github.com/wizath/arm-stack/blob/main/CHANGELOG.md"
+
+[tool.setuptools]
+script-files = ["arm-stack"]
+
+[tool.black]
+line-length = 100
+target-version = ['py36']
+
+[tool.mypy]
+python_version = "3.6"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true 
