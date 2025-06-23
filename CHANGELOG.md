@@ -5,7 +5,7 @@ All notable changes to the ARM Stack Usage Analyzer will be documented in this f
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.2.0] - 2024-12-19
+## [1.2.0] - 2025-06-23
 
 ### Added
 - JSON export functionality with `--export-json` option
@@ -33,7 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Summary statistics comparison
   - File-level aggregated change reporting
 
-## [1.1.0] - 2024-12-19
+## [1.1.0] - 2025-06-13
 
 ### Added
 - Support for Zephyr/CMake `.c.obj` object files in addition to standard `.o` files
@@ -51,7 +51,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Improved `_parse_su_file()` method with proper extension handling
 - Updated `check_prerequisites()` to validate both object file types
 
-## [1.0.0] - 2024-12-19
+## [1.0.0] - 2025-06-13
 
 ### Added
 - Initial release of ARM Stack Usage Analyzer

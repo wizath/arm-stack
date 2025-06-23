@@ -18,42 +18,6 @@ Author: wizath
 GitHub: https://github.com/wizath
 License: MIT
 Version: 1.2
-
-CHANGELOG:
-v1.2 (2024-12-19):
-    - Added RTL-based function pointer detection for unbounded stack analysis
-    - Implemented comprehensive function pointer call detection using RTL dumps
-    - Enhanced unbounded stack analysis with proper propagation through call chains
-    - Added git repository integration for version tracking in analysis reports
-    - Implemented JSON reading functionality (--read-json) for post-analysis filtering
-    - Added threshold-based filtering for existing JSON analysis files
-    - Enhanced JSON output with rich metadata including git information
-    - Improved visual indicators for function types (recursion, function pointers, unbounded)
-    - Added comprehensive test suite for validation of detection algorithms
-    - Deprecated --filter-json in favor of more flexible --read-json option
-
-v1.1 (2024-12-19):
-    - Added support for Zephyr/CMake .c.obj object files
-    - Fixed stack usage file detection for .c.obj -> .c.su mapping
-    - Enhanced object file discovery to handle both .o and .c.obj extensions
-    - Improved error messages to reflect support for both file types
-    - Added JSON export functionality (--export-json)
-    - Added JSON output mode (--json) for direct stdout output
-    - Added short output mode (--short) for simple function list
-    - Added configurable objdump path (--objdump)
-    - Replaced print statements with proper logging system
-    - Improved code formatting and fixed linting issues
-    - Added comparison mode for analyzing changes between builds (--compare)
-    - Implemented git-diff style output for stack usage comparisons
-    - Enhanced analysis data structure with comprehensive metadata
-    - Added support for tracking function additions, removals, and modifications
-    - Improved command-line interface with new export and comparison options
-
-v1.0 (Initial release):
-    - Basic stack usage analysis for ARM embedded projects
-    - Call graph traversal and stack cost calculation
-    - Comprehensive reporting with file-based organization
-    - Symbol resolution and recursion detection
 """
 
 import sys
