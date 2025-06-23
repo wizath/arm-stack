@@ -17,9 +17,21 @@ Requirements:
 Author: wizath
 GitHub: https://github.com/wizath
 License: MIT
-Version: 1.1
+Version: 1.2
 
 CHANGELOG:
+v1.2 (2024-12-19):
+    - Added RTL-based function pointer detection for unbounded stack analysis
+    - Implemented comprehensive function pointer call detection using RTL dumps
+    - Enhanced unbounded stack analysis with proper propagation through call chains
+    - Added git repository integration for version tracking in analysis reports
+    - Implemented JSON reading functionality (--read-json) for post-analysis filtering
+    - Added threshold-based filtering for existing JSON analysis files
+    - Enhanced JSON output with rich metadata including git information
+    - Improved visual indicators for function types (recursion, function pointers, unbounded)
+    - Added comprehensive test suite for validation of detection algorithms
+    - Deprecated --filter-json in favor of more flexible --read-json option
+
 v1.1 (2024-12-19):
     - Added support for Zephyr/CMake .c.obj object files
     - Fixed stack usage file detection for .c.obj -> .c.su mapping
@@ -58,7 +70,7 @@ from pathlib import Path
 from datetime import datetime
 
 # Version information
-__version__ = "1.1"
+__version__ = "1.2"
 __author__ = "wizath"
 __github__ = "https://github.com/wizath"
 
@@ -82,12 +94,14 @@ CALL_COST = 4  # ARM function call overhead in bytes
 
 # Data structure for function information
 FunctionInfo = namedtuple('FunctionInfo', [
-    'name',         # Function name (cleaned)
-    'cost',         # Total stack cost including callees
-    'frame_size',   # Local frame size from .su file
-    'height',       # Call chain depth
-    'is_recursive',  # Whether function is recursive
-    'is_root'       # Whether function is a root (entry point)
+    'name',              # Function name (cleaned)
+    'cost',              # Total stack cost including callees
+    'frame_size',        # Local frame size from .su file
+    'height',            # Call chain depth
+    'is_recursive',      # Whether function is recursive
+    'is_root',           # Whether function is a root (entry point)
+    'is_unbounded',      # Whether function has unbounded stack usage
+    'unbounded_reason'   # Reason for unbounded stack (recursion, function_pointer, etc.)
 ])
 
 
@@ -138,6 +152,13 @@ class StackAnalyzer:
         self.global_name: Dict[str, str] = {}  # func_name -> "func@file"
         self.ambiguous: Set[str] = set()  # Functions with ambiguous names
 
+        # Function pointer detection
+        self.has_function_pointer: Set[str] = set()  # Functions with function pointer calls
+        self.rtl_available: bool = False  # Whether RTL dumps are available
+
+        # Git repository information
+        self.git_info: Dict[str, str] = {}  # Git hash, branch, etc.
+
     def find_object_files(self) -> List[str]:
         """
         Locate all relevant object files in the build directory.
@@ -169,6 +190,117 @@ class StackAnalyzer:
 
         return sorted(obj_files)
 
+    def _find_rtl_files(self, obj_files: List[str]) -> List[str]:
+        """
+        Find RTL dump files corresponding to object files.
+
+        RTL files are generated with -fdump-rtl-dfinish and have extensions like:
+        - .c.270r.dfinish (GCC 5.x)
+        - .c.271r.dfinish (GCC 6.x)
+        - .c.272r.dfinish (GCC 7.x+)
+
+        Args:
+            obj_files: List of object file paths
+
+        Returns:
+            List of RTL dump file paths
+        """
+        rtl_files = []
+
+        for obj_file in obj_files:
+            # Get base name for RTL file search
+            if obj_file.endswith('.o'):
+                base_name = obj_file[:-2]  # Remove .o
+            elif obj_file.endswith('.c.obj'):
+                base_name = obj_file[:-6]  # Remove .c.obj
+            else:
+                continue
+
+            # Search for RTL dump files with various extensions
+            rtl_pattern = f"{base_name}.c.*r.dfinish"
+            matching_files = glob.glob(rtl_pattern)
+
+            if matching_files:
+                # Use the first matching RTL file (should be only one)
+                rtl_files.append(matching_files[0])
+
+        return rtl_files
+
+    def _detect_git_info(self) -> None:
+        """
+        Detect git repository information from current working directory.
+
+        Extracts:
+        - Git commit hash (full and short)
+        - Current branch name
+        - Repository status (clean/dirty)
+        - Remote origin URL (if available)
+        """
+        try:
+            # Check if we're in a git repository
+            result = subprocess.run(['git', 'rev-parse', '--is-inside-work-tree'],
+                                    capture_output=True, text=True, cwd=os.getcwd())
+
+            if result.returncode != 0:
+                self.logger.debug("Not in a git repository")
+                return
+
+            # Get commit hash (full)
+            result = subprocess.run(['git', 'rev-parse', 'HEAD'],
+                                    capture_output=True, text=True, cwd=os.getcwd())
+            if result.returncode == 0:
+                self.git_info['commit_hash'] = result.stdout.strip()
+                self.git_info['commit_hash_short'] = result.stdout.strip()[:8]
+
+            # Get current branch name
+            result = subprocess.run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+                                    capture_output=True, text=True, cwd=os.getcwd())
+            if result.returncode == 0:
+                self.git_info['branch'] = result.stdout.strip()
+
+            # Check if repository is clean
+            result = subprocess.run(['git', 'status', '--porcelain'],
+                                    capture_output=True, text=True, cwd=os.getcwd())
+            if result.returncode == 0:
+                self.git_info['is_clean'] = len(result.stdout.strip()) == 0
+                self.git_info['status'] = 'clean' if self.git_info['is_clean'] else 'dirty'
+
+            # Get remote origin URL (if available)
+            result = subprocess.run(['git', 'remote', 'get-url', 'origin'],
+                                    capture_output=True, text=True, cwd=os.getcwd())
+            if result.returncode == 0:
+                self.git_info['remote_url'] = result.stdout.strip()
+
+            # Get commit message (first line)
+            result = subprocess.run(['git', 'log', '-1', '--pretty=format:%s'],
+                                    capture_output=True, text=True, cwd=os.getcwd())
+            if result.returncode == 0:
+                self.git_info['commit_message'] = result.stdout.strip()
+
+            # Get commit author and date
+            result = subprocess.run(['git', 'log', '-1', '--pretty=format:%an'],
+                                    capture_output=True, text=True, cwd=os.getcwd())
+            if result.returncode == 0:
+                self.git_info['commit_author'] = result.stdout.strip()
+
+            result = subprocess.run(['git', 'log', '-1', '--pretty=format:%ci'],
+                                    capture_output=True, text=True, cwd=os.getcwd())
+            if result.returncode == 0:
+                self.git_info['commit_date'] = result.stdout.strip()
+
+            if self.git_info:
+                branch = self.git_info.get('branch', 'unknown')
+                commit = self.git_info.get('commit_hash_short', 'unknown')
+                self.logger.info(f"  ✓ Git repository detected: {branch}@{commit}")
+                if not self.git_info.get('is_clean', True):
+                    self.logger.info("  ⚠ Repository has uncommitted changes")
+
+        except FileNotFoundError:
+            self.logger.debug("Git not available")
+        except Exception as e:
+            if self.show_warnings:
+                self.logger.warning(f"⚠️ Error detecting git info: {e}")
+
     def check_prerequisites(self) -> None:
         """
         Verify that all required tools and files are available for analysis.
@@ -186,12 +318,17 @@ class StackAnalyzer:
         """
         self.logger.info("🔍 Checking prerequisites...")
 
+        # Detect git repository information
+        self._detect_git_info()
+
         # Verify ARM toolchain availability
         try:
             subprocess.run([self.objdump_path, "--version"], capture_output=True, check=True)
             self.logger.info(f"  ✓ {self.objdump_path} found")
         except (subprocess.CalledProcessError, FileNotFoundError):
-            print(f"{Colors.RED}❌ Error: {self.objdump_path} not found. Please install ARM GCC toolchain or specify correct path with --objdump.{Colors.END}")
+            error_msg = (f"{Colors.RED}❌ Error: {self.objdump_path} not found. "
+                         f"Please install ARM GCC toolchain or specify correct path with --objdump.{Colors.END}")
+            print(error_msg)
             sys.exit(1)
 
         # Verify build directory
@@ -226,6 +363,15 @@ class StackAnalyzer:
 
         self.logger.info(f"  ✓ Found {len(su_files)} stack usage files (from {len(obj_files)} object files)")
 
+        # Check for RTL dump files for function pointer detection
+        rtl_files = self._find_rtl_files(obj_files)
+        if rtl_files:
+            self.rtl_available = True
+            self.logger.info(f"  ✓ Found {len(rtl_files)} RTL dump files for function pointer detection")
+        else:
+            self.logger.info("  ⚠ No RTL dump files found. Function pointer detection disabled.")
+            self.logger.info("  💡 Compile with -fdump-rtl-dfinish for enhanced analysis.")
+
         return obj_files
 
     def parse_object_files(self, obj_files: List[str]) -> None:
@@ -235,6 +381,7 @@ class StackAnalyzer:
         For each object file:
         - Disassembles to find function calls and build call graph
         - Reads corresponding .su file for stack frame sizes
+        - Analyzes RTL dumps for function pointer detection (if available)
 
         Args:
             obj_files: List of object file paths to process
@@ -248,6 +395,10 @@ class StackAnalyzer:
 
             self._parse_disassembly(obj_file)
             self._parse_su_file(obj_file)
+
+        # Parse RTL dumps for function pointer detection if available
+        if self.rtl_available:
+            self._parse_rtl_files(obj_files)
 
         self.logger.info("✓ Parsing complete")
 
@@ -341,6 +492,99 @@ class StackAnalyzer:
             # Stack usage files may not exist for assembly files or system libraries
             pass
 
+    def _parse_rtl_files(self, obj_files: List[str]) -> None:
+        """
+        Parse RTL dump files to detect function pointer calls.
+
+        RTL dumps contain detailed information about function calls including
+        indirect calls via function pointers, which make stack analysis unbounded.
+
+        Args:
+            obj_files: List of object file paths to find corresponding RTL files
+        """
+        self.logger.info("🔍 Analyzing RTL dumps for function pointer detection...")
+
+        rtl_files = self._find_rtl_files(obj_files)
+        functions_with_pointers = 0
+
+        for rtl_file in rtl_files:
+            try:
+                self._parse_single_rtl_file(rtl_file)
+            except Exception as e:
+                if self.show_warnings:
+                    self.logger.warning(f"⚠️ Error parsing RTL file {rtl_file}: {e}")
+
+        functions_with_pointers = len(self.has_function_pointer)
+        if functions_with_pointers > 0:
+            self.logger.info(f"  ✓ Detected {functions_with_pointers} functions with function pointer calls")
+        else:
+            self.logger.info("  ✓ No function pointer calls detected")
+
+    def _parse_single_rtl_file(self, rtl_file: str) -> None:
+        """
+        Parse a single RTL dump file to detect function pointer calls.
+
+        RTL format analysis:
+        - Function definitions: ";; Function function_name (symbol_name, funcdef_no=N)"
+        - Direct calls: '(call ... "function_name" ...)'
+        - Indirect calls: '(call ...' without quoted function name
+
+        Args:
+            rtl_file: Path to RTL dump file
+        """
+        # Extract object file path from RTL file for function mapping
+        if '.c.' in rtl_file and rtl_file.endswith('.dfinish'):
+            # Convert RTL filename back to object file
+            base_name = rtl_file.split('.c.')[0]
+            obj_file = base_name + '.o'
+            if not os.path.exists(obj_file):
+                obj_file = base_name + '.c.obj'
+        else:
+            return
+
+        current_function = None
+
+        # Regex patterns for RTL analysis
+        function_pattern = re.compile(r'^;; Function (.*) \((\S+), funcdef_no=\d+.*\).*$')
+        # Direct calls have symbol_ref with quoted function names
+        direct_call_pattern = re.compile(r'.*\(call.*symbol_ref.*"([^"]+)".*\).*')
+        # Indirect calls use registers instead of symbol_ref
+        indirect_call_pattern = re.compile(r'.*\(call.*\(mem:SI \(reg.*\).*\).*')
+
+        try:
+            with open(rtl_file, 'r', encoding='utf-8', errors='ignore') as f:
+                for line in f:
+                    line = line.strip()
+
+                    # Match function definition
+                    func_match = function_pattern.match(line)
+                    if func_match:
+                        symbol_name = func_match.group(2)
+                        current_function = f"{symbol_name}@{obj_file}"
+                        continue
+
+                    # Skip if no current function context
+                    if not current_function:
+                        continue
+
+                    # Check for direct function calls (these are safe)
+                    if direct_call_pattern.match(line):
+                        continue
+
+                    # Check for indirect function calls (function pointers)
+                    if indirect_call_pattern.match(line):
+                        self.has_function_pointer.add(current_function)
+                        if self.show_warnings:
+                            func_name = current_function.split('@')[0]
+                            self.logger.debug(f"  Function pointer call detected in {func_name}")
+
+        except FileNotFoundError:
+            if self.show_warnings:
+                self.logger.warning(f"⚠️ RTL file not found: {rtl_file}")
+        except Exception as e:
+            if self.show_warnings:
+                self.logger.warning(f"⚠️ Error reading RTL file {rtl_file}: {e}")
+
     def resolve_symbols(self) -> None:
         """
         Resolve function call targets using symbol tables and address mappings.
@@ -416,6 +660,13 @@ class StackAnalyzer:
             # Mark as currently being processed
             self.visited[func_name] = "?"
 
+            # Check if function has function pointer calls (unbounded stack)
+            if func_name in self.has_function_pointer:
+                self.visited[func_name] = "P"  # Mark as function pointer
+                self.total_cost[func_name] = float('inf')  # Unbounded
+                self.call_depth[func_name] = float('inf')
+                return
+
             max_depth = 0
             max_frame = 0
 
@@ -428,6 +679,13 @@ class StackAnalyzer:
                     callee_cost = self.total_cost.get(callee, 0)
                     callee_depth = self.call_depth.get(callee, 0)
 
+                    # If any callee is unbounded, this function is unbounded
+                    if callee_cost == float('inf') or callee_depth == float('inf'):
+                        self.visited[func_name] = "U"  # Mark as unbounded
+                        self.total_cost[func_name] = float('inf')
+                        self.call_depth[func_name] = float('inf')
+                        return
+
                     # Track maximum cost and depth among callees
                     max_frame = max(max_frame, callee_cost)
                     max_depth = max(max_depth, callee_depth)
@@ -436,7 +694,7 @@ class StackAnalyzer:
             self.call_depth[func_name] = max_depth + 1
             self.total_cost[func_name] = max_frame + self.frame_size.get(func_name, 0)
 
-            # Mark as completed (if not recursive)
+            # Mark as completed (if not recursive or unbounded)
             if self.visited[func_name] == "?":
                 self.visited[func_name] = " "
 
@@ -486,15 +744,30 @@ class StackAnalyzer:
                     display_name = base_name
 
             # Determine function characteristics
-            is_recursive = self.visited.get(func_full_name, ' ') == 'R'
+            visit_status = self.visited.get(func_full_name, ' ')
+            is_recursive = visit_status == 'R'
             is_root = func_full_name not in self.has_caller
             cost = self.total_cost[func_full_name]
 
-            # Track special functions for summary
-            if "__vector_" in func_full_name:
-                max_iv_cost = max(max_iv_cost, cost)
-            elif func_full_name.startswith("main@"):
-                main_cost = cost
+            # Determine unbounded status and reason
+            is_unbounded = cost == float('inf')
+            unbounded_reason = None
+            if is_unbounded:
+                if visit_status == 'R':
+                    unbounded_reason = 'recursion'
+                elif visit_status == 'P':
+                    unbounded_reason = 'function_pointer'
+                elif visit_status == 'U':
+                    unbounded_reason = 'unbounded_callee'
+                else:
+                    unbounded_reason = 'unknown'
+
+            # Track special functions for summary (skip unbounded functions)
+            if not is_unbounded:
+                if "__vector_" in func_full_name:
+                    max_iv_cost = max(max_iv_cost, cost)
+                elif func_full_name.startswith("main@"):
+                    main_cost = cost
 
             func_info = FunctionInfo(
                 name=display_name,
@@ -502,7 +775,9 @@ class StackAnalyzer:
                 frame_size=self.frame_size.get(func_full_name, 0),
                 height=self.call_depth.get(func_full_name, 0),
                 is_recursive=is_recursive,
-                is_root=is_root
+                is_root=is_root,
+                is_unbounded=is_unbounded,
+                unbounded_reason=unbounded_reason
             )
 
             functions.append(func_info)
@@ -558,15 +833,30 @@ class StackAnalyzer:
                     display_name = base_name
 
             # Determine function characteristics
-            is_recursive = self.visited.get(func_full_name, ' ') == 'R'
+            visit_status = self.visited.get(func_full_name, ' ')
+            is_recursive = visit_status == 'R'
             is_root = func_full_name not in self.has_caller
             cost = self.total_cost[func_full_name]
 
-            # Track special functions for summary
-            if "__vector_" in func_full_name:
-                max_iv_cost = max(max_iv_cost, cost)
-            elif func_full_name.startswith("main@"):
-                main_cost = cost
+            # Determine unbounded status and reason
+            is_unbounded = cost == float('inf')
+            unbounded_reason = None
+            if is_unbounded:
+                if visit_status == 'R':
+                    unbounded_reason = 'recursion'
+                elif visit_status == 'P':
+                    unbounded_reason = 'function_pointer'
+                elif visit_status == 'U':
+                    unbounded_reason = 'unbounded_callee'
+                else:
+                    unbounded_reason = 'unknown'
+
+            # Track special functions for summary (skip unbounded functions)
+            if not is_unbounded:
+                if "__vector_" in func_full_name:
+                    max_iv_cost = max(max_iv_cost, cost)
+                elif func_full_name.startswith("main@"):
+                    main_cost = cost
 
             func_info = FunctionInfo(
                 name=display_name,
@@ -574,7 +864,9 @@ class StackAnalyzer:
                 frame_size=self.frame_size.get(func_full_name, 0),
                 height=self.call_depth.get(func_full_name, 0),
                 is_recursive=is_recursive,
-                is_root=is_root
+                is_root=is_root,
+                is_unbounded=is_unbounded,
+                unbounded_reason=unbounded_reason
             )
 
             functions.append(func_info)
@@ -599,7 +891,7 @@ class StackAnalyzer:
 
         for func_full_name in self.total_cost.keys():
             cost = self.total_cost[func_full_name]
-            if cost >= self.threshold:
+            if cost >= self.threshold or cost == float('inf'):
                 # Extract clean function name
                 display_name = func_full_name
                 if '@' in func_full_name:
@@ -608,14 +900,15 @@ class StackAnalyzer:
                     if base_name not in self.ambiguous:
                         display_name = base_name
 
-                function_costs.append((display_name, cost))
+                cost_display = "unbounded" if cost == float('inf') else str(cost)
+                function_costs.append((display_name, cost, cost_display))
 
-        # Sort by cost (descending)
-        function_costs.sort(key=lambda x: x[1], reverse=True)
+        # Sort by cost (unbounded first, then descending)
+        function_costs.sort(key=lambda x: (0 if x[1] == float('inf') else 1, -x[1] if x[1] != float('inf') else 0))
 
         # Output the list
-        for func_name, cost in function_costs:
-            print(f"{func_name}: {cost}")
+        for func_name, _, cost_display in function_costs:
+            print(f"{func_name}: {cost_display}")
 
     def _build_analysis_data(
             self,
@@ -635,14 +928,21 @@ class StackAnalyzer:
         Returns:
             Analysis data dictionary
         """
+        metadata = {
+            'timestamp': datetime.now().isoformat(),
+            'build_dir': str(self.build_dir),
+            'threshold': self.threshold,
+            'total_functions': len(functions),
+            'functions_analyzed': len([f for f in functions if f.cost > 0]),
+            'rtl_analysis_enabled': self.rtl_available
+        }
+
+        # Add git information if available
+        if self.git_info:
+            metadata['git'] = self.git_info.copy()
+
         return {
-            'metadata': {
-                'timestamp': datetime.now().isoformat(),
-                'build_dir': str(self.build_dir),
-                'threshold': self.threshold,
-                'total_functions': len(functions),
-                'functions_analyzed': len([f for f in functions if f.cost > 0])
-            },
+            'metadata': metadata,
             'summary': {
                 'main_cost': main_cost,
                 'max_interrupt_cost': max_iv_cost,
@@ -653,13 +953,15 @@ class StackAnalyzer:
             'functions': [
                 {
                     'name': func.name,
-                    'total_cost': func.cost,
+                    'total_cost': func.cost if not func.is_unbounded else 'unbounded',
                     'frame_size': func.frame_size,
-                    'call_depth': func.height,
+                    'call_depth': func.height if func.height != float('inf') else 'unbounded',
                     'is_recursive': func.is_recursive,
-                    'is_root': func.is_root
+                    'is_root': func.is_root,
+                    'is_unbounded': func.is_unbounded,
+                    'unbounded_reason': func.unbounded_reason
                 }
-                for func in functions if func.cost > 0
+                for func in functions if func.cost > 0 or func.is_unbounded
             ],
             'files': {
                 filename: {
@@ -713,20 +1015,28 @@ class StackAnalyzer:
         Args:
             functions: List of function information objects
         """
-        # Apply threshold filter
-        filtered_functions = [f for f in functions if f.cost >= self.threshold]
+        # Apply threshold filter (include unbounded functions)
+        filtered_functions = [f for f in functions if f.cost >= self.threshold or f.is_unbounded]
 
         if not filtered_functions:
             print(f"{Colors.YELLOW}⚠️  No functions with significant stack usage found{Colors.END}")
             return
 
         print(f"{Colors.BOLD}📋 Function Stack Usage Analysis{Colors.END}")
-        print(f"{Colors.CYAN}   (Showing {len(filtered_functions)} functions with stack usage ≥{self.threshold} bytes){Colors.END}")
-        print(f"{Colors.CYAN}   Total = Frame + Max(Callees), Frame = Local variables, Depth = Call chain length{Colors.END}\n")
+        threshold_msg = (f"   (Showing {len(filtered_functions)} functions with stack usage "
+                         f"≥{self.threshold} bytes or unbounded)")
+        print(f"{Colors.CYAN}{threshold_msg}{Colors.END}")
+        frame_msg = "   Total = Frame + Max(Callees), Frame = Local variables, Depth = Call chain length"
+        print(f"{Colors.CYAN}{frame_msg}{Colors.END}")
+        symbols_msg = "   Symbols: ▶=Root, 🔄=Recursive, ⚠=Function pointer, ❌=Unbounded"
+        print(f"{Colors.CYAN}{symbols_msg}{Colors.END}\n")
 
         # Table header with proper alignment
-        print(f"{Colors.BOLD}{Colors.UNDERLINE}{'Flag':<5}{'Function Name':<40} {'Total':<7} {'Frame':<7} {'Depth':<5}{Colors.END}")
-        print(f"{Colors.BOLD}{Colors.UNDERLINE}{'─────':<5}{'────────────────────────────────────────':<40} {'─────':<7} {'─────':<7} {'─────':<5}{Colors.END}")
+        header = f"{'Flag':<5}{'Function Name':<40} {'Total':<9} {'Frame':<7} {'Depth':<5}"
+        print(f"{Colors.BOLD}{Colors.UNDERLINE}{header}{Colors.END}")
+        separator = (f"{'─────':<5}{'────────────────────────────────────────':<40} "
+                     f"{'─────────':<9} {'─────':<7} {'─────':<5}")
+        print(f"{Colors.BOLD}{Colors.UNDERLINE}{separator}{Colors.END}")
 
         # Display function rows
         for func in filtered_functions:
@@ -735,10 +1045,15 @@ class StackAnalyzer:
         # Summary information
         very_low_cost = len([f for f in functions if f.cost < self.threshold and f.cost > 0])
         if very_low_cost > 0:
-            print(f"\n{Colors.CYAN}💭 {very_low_cost} functions with very low cost (<{self.threshold} bytes) hidden for clarity{Colors.END}")
+            low_cost_msg = (f"\n{Colors.CYAN}💭 {very_low_cost} functions with very low cost "
+                            f"(<{self.threshold} bytes) hidden for clarity{Colors.END}")
+            print(low_cost_msg)
 
-        print(
-            f"\n{Colors.BOLD}📊 Displayed {len(filtered_functions)} of {len([f for f in functions if f.cost > 0])} functions with stack usage{Colors.END}")
+        displayed_count = len(filtered_functions)
+        total_with_usage = len([f for f in functions if f.cost > 0])
+        summary_msg = (f"\n{Colors.BOLD}📊 Displayed {displayed_count} of {total_with_usage} "
+                       f"functions with stack usage{Colors.END}")
+        print(summary_msg)
 
     def _print_function_row(self, func: FunctionInfo, color: str) -> None:
         """
@@ -747,6 +1062,8 @@ class StackAnalyzer:
         Uses consistent formatting with visual indicators for function types:
         - ▶ for root functions (entry points)
         - 🔄 for recursive functions
+        - ⚠ for functions with function pointer calls
+        - ❌ for unbounded functions (other reasons)
         - Color coding based on stack cost
 
         Args:
@@ -754,33 +1071,37 @@ class StackAnalyzer:
             color: Base color for the row
         """
         # Determine function type indicator with consistent spacing
-        if func.is_recursive:
-            flag = f"{Colors.RED}🔄{Colors.END}  "  # Recursive function
+        if func.is_unbounded:
+            if func.unbounded_reason == 'recursion':
+                flag = f"{Colors.RED}🔄{Colors.END}  "  # Recursive function
+            elif func.unbounded_reason == 'function_pointer':
+                flag = f"{Colors.YELLOW}⚠{Colors.END}   "  # Function pointer call
+            else:
+                flag = f"{Colors.RED}❌{Colors.END}  "  # Other unbounded reason
         elif func.is_root:
             flag = f"{Colors.GREEN}▶{Colors.END}   "  # Root function
         else:
             flag = "     "  # Regular function
 
         # Apply cost-based color coding
-        cost_color = Colors.END
-        if func.cost >= 500:
-            cost_color = f"{Colors.RED}{Colors.BOLD}"
-        elif func.cost >= 200:
-            cost_color = f"{Colors.RED}"
-        elif func.cost >= 100:
-            cost_color = f"{Colors.YELLOW}"
-        elif func.cost >= 50:
-            cost_color = f"{Colors.CYAN}"
-        else:
-            cost_color = Colors.END
+        cost_display = str(func.cost)
+
+        if func.is_unbounded:
+            cost_display = "unbounded"
+        # Color coding is applied directly in the row formatting below
 
         # Handle long function names
         display_name = func.name
         if len(display_name) > 39:
             display_name = display_name[:36] + "..."
 
+        # Handle unbounded depth display
+        depth_display = str(func.height) if func.height != float('inf') else "∞"
+
         # Print formatted row with consistent alignment
-        print(f"{flag}{display_name:<40} {cost_color}{func.cost:<7}{Colors.END} {func.frame_size:<7} {func.height:<5}")
+        row = (f"{display_name:<40} {cost_display:<9} {func.get('frame_size', 0):<7} "
+               f"{depth_display:<5} {flag}")
+        print(row)
 
     def _print_summary(self, main_cost: int, max_iv_cost: int) -> None:
         """
@@ -802,16 +1123,18 @@ class StackAnalyzer:
         interrupt_cost = self.total_cost.get("INTERRUPT", 0)
         total_peak = main_cost + max_iv_cost
 
-        print(f"🎯 Peak execution estimate:")
+        print("🎯 Peak execution estimate:")
         print(f"   Main function cost:     {Colors.CYAN}{main_cost:>6}{Colors.END} bytes")
         print(f"   Worst interrupt cost:   {Colors.YELLOW}{max_iv_cost:>6}{Colors.END} bytes")
         print(f"   Virtual interrupt node: {Colors.BLUE}{interrupt_cost:>6}{Colors.END} bytes")
-        print(f"   {Colors.BOLD}Total estimated peak:   {Colors.GREEN}{total_peak:>6}{Colors.END}{Colors.BOLD} bytes{Colors.END}")
+        total_msg = (f"   {Colors.BOLD}Total estimated peak:   "
+                     f"{Colors.GREEN}{total_peak:>6}{Colors.END}{Colors.BOLD} bytes{Colors.END}")
+        print(total_msg)
 
         # Additional statistics
         all_costs = list(self.total_cost.values())
         if all_costs:
-            print(f"\n📈 Statistics:")
+            print("\n📈 Statistics:")
             print(f"   Functions analyzed:     {Colors.CYAN}{len(all_costs):>6}{Colors.END}")
             print(f"   Average stack usage:    {Colors.YELLOW}{sum(all_costs)//len(all_costs):>6}{Colors.END} bytes")
             print(f"   Maximum single function:{Colors.RED}{max(all_costs):>6}{Colors.END} bytes")
@@ -871,6 +1194,146 @@ def load_json_data(file_path: str) -> Optional[Dict]:
         return None
 
 
+def read_and_display_json(json_file: str, threshold: int = 0, output_format: str = 'table') -> None:
+    """
+    Read JSON analysis file and display it, optionally filtering by threshold.
+
+    Args:
+        json_file: Path to JSON analysis file
+        threshold: Minimum stack usage threshold in bytes (0 = show all)
+        output_format: Output format ('table', 'json', 'short')
+    """
+    data = load_json_data(json_file)
+    if not data:
+        return
+
+    # Get all functions or filter by threshold
+    all_functions = data.get('functions', [])
+    if threshold > 0:
+        # Filter functions by threshold
+        filtered_functions = []
+        for func in all_functions:
+            cost = func.get('total_cost')
+            if cost == 'unbounded' or (isinstance(cost, (int, float)) and cost >= threshold):
+                filtered_functions.append(func)
+        functions_to_show = filtered_functions
+        is_filtered = True
+    else:
+        functions_to_show = all_functions
+        is_filtered = False
+
+    if output_format == 'json':
+        # Output data as JSON
+        if is_filtered:
+            filtered_data = data.copy()
+            filtered_data['functions'] = functions_to_show
+            filtered_data['metadata']['filtered_threshold'] = threshold
+            filtered_data['metadata']['filtered_count'] = len(functions_to_show)
+            print(json.dumps(filtered_data, indent=2, sort_keys=True))
+        else:
+            print(json.dumps(data, indent=2, sort_keys=True))
+
+    elif output_format == 'short':
+        # Simple list format
+        for func in sorted(functions_to_show, key=lambda x: 0 if x['total_cost'] == 'unbounded' else -x['total_cost']):
+            cost_display = func['total_cost'] if func['total_cost'] == 'unbounded' else str(func['total_cost'])
+            print(f"{func['name']}: {cost_display}")
+
+    else:
+        # Table format (default)
+        title = "📊 FILTERED STACK USAGE ANALYSIS" if is_filtered else "📊 STACK USAGE ANALYSIS"
+        print(f"{Colors.BOLD}{Colors.HEADER}{title}{Colors.END}")
+        print(f"{Colors.CYAN}Source: {json_file}{Colors.END}")
+
+        if is_filtered:
+            print(f"{Colors.CYAN}Threshold: ≥{threshold} bytes or unbounded{Colors.END}")
+            print(f"{Colors.CYAN}Showing: {len(functions_to_show)} of {len(all_functions)} functions{Colors.END}\n")
+        else:
+            print(f"{Colors.CYAN}Showing: {len(functions_to_show)} functions{Colors.END}\n")
+
+        if not functions_to_show:
+            if is_filtered:
+                print(f"{Colors.YELLOW}⚠️  No functions found with stack usage ≥{threshold} bytes{Colors.END}")
+            else:
+                print(f"{Colors.YELLOW}⚠️  No functions found in analysis{Colors.END}")
+            return
+
+        # Display metadata summary
+        metadata = data.get('metadata', {})
+        if metadata:
+            print(f"{Colors.BOLD}📋 Analysis Metadata:{Colors.END}")
+            if 'timestamp' in metadata:
+                print(f"  Analysis time: {metadata['timestamp']}")
+            if 'build_dir' in metadata:
+                print(f"  Build directory: {metadata['build_dir']}")
+            if 'total_functions' in metadata:
+                print(f"  Total functions: {metadata['total_functions']}")
+            if 'rtl_analysis_enabled' in metadata:
+                rtl_status = "enabled" if metadata['rtl_analysis_enabled'] else "disabled"
+                print(f"  RTL analysis: {rtl_status}")
+            if 'git' in metadata and metadata['git']:
+                git_info = metadata['git']
+                print(f"  Git: {git_info.get('branch', 'unknown')}@{git_info.get('commit_hash_short', 'unknown')}")
+            print()
+
+        # Table header
+        header = f"{'Function Name':<40} {'Total':<9} {'Frame':<7} {'Depth':<5} {'Type':<12}"
+        print(f"{Colors.BOLD}{Colors.UNDERLINE}{header}{Colors.END}")
+        separator = (f"{'────────────────────────────────────────':<40} "
+                     f"{'─────────':<9} {'─────':<7} {'─────':<5} "
+                     f"{'────────────':<12}")
+        print(f"{Colors.BOLD}{Colors.UNDERLINE}{separator}{Colors.END}")
+
+        # Sort by cost (unbounded first, then descending)
+        sorted_functions = sorted(functions_to_show, key=lambda x: (
+            0 if x['total_cost'] == 'unbounded' else 1, -(x['total_cost'] if x['total_cost'] != 'unbounded' else 0)))
+
+        for func in sorted_functions:
+            # Determine function type and color
+            if func.get('is_unbounded', False):
+                if func.get('unbounded_reason') == 'recursion':
+                    type_indicator = f"{Colors.RED}🔄 Recursive{Colors.END}"
+                elif func.get('unbounded_reason') == 'function_pointer':
+                    type_indicator = f"{Colors.YELLOW}⚠ Func Ptr{Colors.END}"
+                else:
+                    type_indicator = f"{Colors.RED}❌ Unbounded{Colors.END}"
+                cost_display = f"{Colors.RED}{Colors.BOLD}unbounded{Colors.END}"
+            else:
+                type_indicator = f"{Colors.GREEN}▶ Root{Colors.END}" if func.get('is_root', False) else "  Normal"
+                cost = func['total_cost']
+                if cost >= 500:
+                    cost_display = f"{Colors.RED}{Colors.BOLD}{cost}{Colors.END}"
+                elif cost >= 200:
+                    cost_display = f"{Colors.RED}{cost}{Colors.END}"
+                elif cost >= 100:
+                    cost_display = f"{Colors.YELLOW}{cost}{Colors.END}"
+                else:
+                    cost_display = f"{Colors.CYAN}{cost}{Colors.END}"
+
+            # Handle long function names
+            display_name = func['name']
+            if len(display_name) > 39:
+                display_name = display_name[:36] + "..."
+
+            depth_display = str(func.get('call_depth', 0)) if func.get('call_depth') != 'unbounded' else "∞"
+
+            row = (f"{display_name:<40} {cost_display:<9} {func.get('frame_size', 0):<7} "
+                   f"{depth_display:<5} {type_indicator}")
+            print(row)
+
+        # Summary
+        print(f"\n{Colors.BOLD}📈 Summary:{Colors.END}")
+        unbounded_count = len([f for f in functions_to_show if f.get('is_unbounded', False)])
+        bounded_count = len(functions_to_show) - unbounded_count
+        print(f"  Unbounded functions: {Colors.RED}{unbounded_count}{Colors.END}")
+        print(f"  Bounded functions:   {Colors.GREEN}{bounded_count}{Colors.END}")
+        print(f"  Total shown:         {Colors.CYAN}{len(functions_to_show)}{Colors.END}")
+
+        if is_filtered and len(functions_to_show) < len(all_functions):
+            hidden_count = len(all_functions) - len(functions_to_show)
+            print(f"  Hidden (< threshold): {Colors.YELLOW}{hidden_count}{Colors.END}")
+
+
 def compare_analyses(old_data: Dict, new_data: Dict) -> None:
     """
     Compare two stack analysis results and display git-diff like output.
@@ -926,8 +1389,11 @@ def compare_analyses(old_data: Dict, new_data: Dict) -> None:
 
     if changes:
         print(f"\n{Colors.BOLD}🔄 Function Changes:{Colors.END}")
-        print(f"{Colors.BOLD}{Colors.UNDERLINE}{'Status':<8} {'Function Name':<40} {'Old':<7} {'New':<7} {'Diff':<8}{Colors.END}")
-        print(f"{Colors.BOLD}{Colors.UNDERLINE}{'────────':<8} {'────────────────────────────────────────':<40} {'───':<7} {'───':<7} {'────────':<8}{Colors.END}")
+        header = f"{'Status':<8} {'Function Name':<40} {'Old':<7} {'New':<7} {'Diff':<8}"
+        print(f"{Colors.BOLD}{Colors.UNDERLINE}{header}{Colors.END}")
+        separator = (f"{'────────':<8} {'────────────────────────────────────────':<40} "
+                     f"{'───':<7} {'───':<7} {'────────':<8}")
+        print(f"{Colors.BOLD}{Colors.UNDERLINE}{separator}{Colors.END}")
 
         # Sort by absolute difference (largest changes first)
         changes.sort(key=lambda x: abs(x[3]), reverse=True)
@@ -974,7 +1440,9 @@ def _print_summary_diff(label: str, old_val: int, new_val: int) -> None:
     else:
         color = Colors.RED if diff > 0 else Colors.GREEN
         sign = '+' if diff > 0 else ''
-        print(f"  {label:<20}: {old_val:>6} → {color}{new_val:>6}{Colors.END} bytes ({color}{sign}{diff:>+6}{Colors.END})")
+        summary_msg = (f"  {label:<20}: {old_val:>6} → {color}{new_val:>6}{Colors.END} bytes "
+                       f"({color}{sign}{diff:>+6}{Colors.END})")
+        print(summary_msg)
 
 
 def _print_function_diff(func_name: str, old_cost: int, new_cost: int, diff: int, status: str) -> None:
@@ -983,20 +1451,28 @@ def _print_function_diff(func_name: str, old_cost: int, new_cost: int, diff: int
     display_name = func_name[:39] + "..." if len(func_name) > 39 else func_name
 
     if status == 'added':
-        print(f"{Colors.GREEN}+ ADD   {Colors.END} {display_name:<40} {'-':<7} {new_cost:<7} {Colors.GREEN}+{diff:<7}{Colors.END}")
+        add_msg = (f"{Colors.GREEN}+ ADD   {Colors.END} {display_name:<40} {'-':<7} "
+                   f"{new_cost:<7} {Colors.GREEN}+{diff:<7}{Colors.END}")
+        print(add_msg)
     elif status == 'removed':
-        print(f"{Colors.RED}- DEL   {Colors.END} {display_name:<40} {old_cost:<7} {'-':<7} {Colors.RED}{diff:<8}{Colors.END}")
+        del_msg = (f"{Colors.RED}- DEL   {Colors.END} {display_name:<40} {old_cost:<7} "
+                   f"{'-':<7} {Colors.RED}{diff:<8}{Colors.END}")
+        print(del_msg)
     else:  # modified
         color = Colors.RED if diff > 0 else Colors.GREEN
         sign = '+' if diff > 0 else ''
-        print(f"{color}~ MOD   {Colors.END} {display_name:<40} {old_cost:<7} {new_cost:<7} {color}{sign}{diff:<7}{Colors.END}")
+        mod_msg = (f"{color}~ MOD   {Colors.END} {display_name:<40} {old_cost:<7} "
+                   f"{new_cost:<7} {color}{sign}{diff:<7}{Colors.END}")
+        print(mod_msg)
 
 
 def _print_file_diff(file_name: str, old_total: int, new_total: int, diff: int) -> None:
     """Print a file-level difference."""
     color = Colors.RED if diff > 0 else Colors.GREEN
     sign = '+' if diff > 0 else ''
-    print(f"  {file_name:<30}: {old_total:>6} → {color}{new_total:>6}{Colors.END} bytes ({color}{sign}{diff:>+6}{Colors.END})")
+    file_msg = (f"  {file_name:<30}: {old_total:>6} → {color}{new_total:>6}{Colors.END} bytes "
+                f"({color}{sign}{diff:>+6}{Colors.END})")
+    print(file_msg)
 
 
 def main():
@@ -1021,6 +1497,15 @@ Examples:
   python3 arm-stack build --short
   python3 arm-stack build --objdump /path/to/arm-none-eabi-objdump
   python3 arm-stack --compare old.json new.json
+  python3 arm-stack --read-json analysis.json
+  python3 arm-stack --read-json analysis.json --threshold 100
+  python3 arm-stack --read-json analysis.json --threshold 50 --json
+  python3 arm-stack --read-json analysis.json --short
+  python3 arm-stack --filter-json analysis.json --threshold 100  # deprecated
+
+Function Pointer Detection:
+  Compile with: gcc -c -fstack-usage -fdump-rtl-dfinish source.c
+  Analyze with: python3 arm-stack build
         """
     )
     parser.add_argument('build_dir', nargs='?', help='Build directory containing object files')
@@ -1038,6 +1523,13 @@ Examples:
                         help=f'Path to objdump executable (default: {DEFAULT_OBJDUMP})')
     parser.add_argument('--compare', type=str, nargs=2, metavar=('OLD', 'NEW'),
                         help='Compare two JSON analysis files')
+    parser.add_argument('--read-json', type=str, metavar='FILE',
+                        help='Read and display JSON analysis file (can be combined with --threshold for filtering)')
+    parser.add_argument(
+        '--filter-json',
+        type=str,
+        metavar='FILE',
+        help='Read JSON file and filter functions by stack usage threshold (deprecated: use --read-json)')
     parser.add_argument('--version', action='version', version=f'%(prog)s {__version__} by {__author__} ({__github__})')
 
     args = parser.parse_args()
@@ -1055,7 +1547,7 @@ Examples:
         # Normal mode: show info and warnings
         log_level = logging.INFO
         log_stream = sys.stdout
-    
+
     logging.basicConfig(
         level=log_level,
         format='%(message)s',
@@ -1085,9 +1577,30 @@ Examples:
             sys.exit(1)
         return
 
+    # Handle JSON reading/filtering mode
+    if args.read_json:
+        if not args.json and not args.short:
+            print(f"{Colors.BOLD}{Colors.HEADER}🔍 ARM Stack Usage Analyzer - JSON Reader Mode{Colors.END}")
+
+        output_format = 'json' if args.json else ('short' if args.short else 'table')
+        # Use threshold from command line (0 means show all)
+        threshold = args.threshold if args.threshold > 10 else 0  # Only filter if threshold was explicitly set
+        read_and_display_json(args.read_json, threshold, output_format)
+        return
+
+    # Handle legacy JSON filtering mode (deprecated)
+    if args.filter_json:
+        if not args.json and not args.short:
+            print(f"{Colors.BOLD}{Colors.HEADER}🔍 ARM Stack Usage Analyzer - JSON Filter Mode (deprecated){Colors.END}")
+            print(f"{Colors.YELLOW}⚠️  --filter-json is deprecated, use --read-json instead{Colors.END}")
+
+        output_format = 'json' if args.json else ('short' if args.short else 'table')
+        read_and_display_json(args.filter_json, args.threshold, output_format)
+        return
+
     # Require build directory for analysis mode
     if not args.build_dir:
-        parser.error("build_dir is required unless using --compare")
+        parser.error("build_dir is required unless using --compare, --read-json, or --filter-json")
 
     # Display tool header (unless in JSON or short mode)
     if not args.json and not args.short:

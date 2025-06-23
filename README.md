@@ -12,8 +12,11 @@ A comprehensive tool for analyzing stack usage in ARM embedded projects. This Py
 - **Symbol Resolution**: Handles complex symbol resolution across multiple object files
 - **Professional Output**: Clean, readable reports suitable for documentation and code reviews
 - **JSON Export**: Export analysis data to JSON format for automation and CI/CD integration
+- **JSON Reading**: Read and filter existing JSON analysis files with threshold-based filtering
 - **Comparison Mode**: Compare stack usage between different builds with git-diff style output
 - **Multiple Output Formats**: Standard report, JSON output, or short function list
+- **Function Pointer Detection**: RTL-based detection of function pointer calls for accurate unbounded analysis
+- **Git Integration**: Automatically includes git repository information in analysis reports
 - **Zephyr/CMake Support**: Handles both `.o` and `.c.obj` object file formats
 
 ## Requirements
@@ -34,6 +37,14 @@ target_compile_options(your_target PRIVATE -fstack-usage)
 Or for Makefile-based projects:
 ```makefile
 CFLAGS += -fstack-usage
+```
+
+### Enhanced Analysis (Optional)
+For function pointer detection and enhanced unbounded analysis, also compile with RTL dumps:
+
+```cmake
+# Enhanced analysis with function pointer detection
+target_compile_options(your_target PRIVATE -fstack-usage -fdump-rtl-dfinish)
 ```
 
 ## Installation
@@ -103,6 +114,12 @@ arm-stack build --short
 # Compare two analysis files
 arm-stack --compare old_analysis.json new_analysis.json
 
+# Read and display JSON analysis file
+arm-stack --read-json analysis.json
+
+# Filter JSON analysis by threshold
+arm-stack --read-json analysis.json --threshold 100
+
 # Custom objdump path
 arm-stack build --objdump /path/to/arm-none-eabi-objdump
 
@@ -126,6 +143,7 @@ arm-stack cmake-build-debug --threshold 100 --no-warnings --export-json results.
 | `--short` | Output only function list with stack usage | False |
 | `--objdump PATH` | Path to objdump executable | arm-none-eabi-objdump |
 | `--compare OLD NEW` | Compare two JSON analysis files | None |
+| `--read-json FILE` | Read and display JSON analysis file | None |
 
 ## Output Format
 
@@ -157,6 +175,8 @@ Flag Function Name                        Total   Frame   Depth
 **Legend:**
 - `▶` Root function (entry point)
 - `🔄` Recursive function
+- `⚠` Function pointer call (unbounded)
+- `❌` Unbounded function (other reasons)
 - **Total**: Frame size + maximum callee cost
 - **Frame**: Local variables and call overhead
 - **Depth**: Maximum call chain length
@@ -215,6 +235,30 @@ The comparison output shows:
 - File-level aggregated changes
 - Git-diff style color-coded output
 
+### JSON Analysis and Filtering
+
+Read and analyze existing JSON files with optional filtering:
+
+```bash
+# Display complete analysis from JSON file
+arm-stack --read-json analysis.json
+
+# Filter functions with stack usage >= 100 bytes
+arm-stack --read-json analysis.json --threshold 100
+
+# Output filtered results as JSON
+arm-stack --read-json analysis.json --threshold 50 --json
+
+# Simple function list format
+arm-stack --read-json analysis.json --short
+```
+
+This feature is useful for:
+- Post-processing analysis results
+- Creating filtered reports for specific teams
+- Automated threshold-based validation
+- Integration with custom reporting tools
+
 ## Algorithm Details
 
 ### Call Graph Construction
@@ -230,9 +274,12 @@ The comparison output shows:
 
 ### Key Features
 - **Cycle Detection**: Identifies and marks recursive functions
+- **Function Pointer Detection**: RTL-based analysis to detect indirect function calls
+- **Unbounded Analysis**: Proper handling of functions with unbounded stack usage
 - **Ambiguity Handling**: Manages functions with identical names across files
 - **External Function Handling**: Tracks unresolved external library calls
 - **Interrupt Analysis**: Special handling for interrupt service routines
+- **Git Integration**: Automatic repository information inclusion in reports
 
 ## Troubleshooting
 
@@ -267,24 +314,6 @@ The comparison output shows:
 5. **Use JSON Export**: Export data with `--export-json` for detailed analysis
 6. **Compare Builds**: Use `--compare` to track changes between builds
 
-## Comparison with avstack.pl
-
-This tool is inspired by the original `avstack.pl` but provides several enhancements:
-
-| Feature | avstack.pl | arm-stack |
-|---------|------------|-----------|
-| Language | Perl | Python 3 |
-| Output Format | Plain text | Color-coded, formatted |
-| File Organization | Single list | Grouped by source file |
-| Filtering | Limited | Configurable thresholds |
-| Error Handling | Basic | Comprehensive validation |
-| Visualization | Minimal | Enhanced with icons/colors |
-| Extensibility | Limited | Modular Python design |
-| JSON Export | No | Yes |
-| Comparison Mode | No | Yes |
-| Build System Support | Basic | Zephyr/CMake support |
-| Installation | Manual | pip installable |
-
 ## Contributing
 
 Contributions are welcome! Areas for improvement:
@@ -308,7 +337,3 @@ This installs the package in development mode with additional tools for testing 
 ## License
 
 MIT License - see LICENSE file for details.
-
-## Author
-
-Stack Analysis Tool - Professional embedded systems analysis utility. 
