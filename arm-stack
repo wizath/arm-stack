@@ -1063,8 +1063,8 @@ class StackAnalyzer:
         depth_display = str(func.height) if func.height != float('inf') else "∞"
 
         # Print formatted row with consistent alignment
-        row = (f"{display_name:<40} {cost_display:<9} {func.get('frame_size', 0):<7} "
-               f"{depth_display:<5} {flag}")
+        row = (f"{flag}{display_name:<40} {cost_display:<9} {func.frame_size:<7} "
+               f"{depth_display:<5}")
         print(row)
 
     def _print_summary(self, main_cost: int, max_iv_cost: int) -> None:
