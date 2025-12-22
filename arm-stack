@@ -17,7 +17,7 @@ Requirements:
 Author: wizath
 GitHub: https://github.com/wizath
 License: MIT
-Version: 1.2
+Version: 1.5
 """
 
 import sys
@@ -34,7 +34,7 @@ from pathlib import Path
 from datetime import datetime
 
 # Version information
-__version__ = "1.2"
+__version__ = "1.5"
 __author__ = "wizath"
 __github__ = "https://github.com/wizath"
 
@@ -55,6 +55,41 @@ class Colors:
 # Tool configuration constants
 DEFAULT_OBJDUMP = "arm-none-eabi-objdump"
 CALL_COST = 4  # ARM function call overhead in bytes
+DEFAULT_STACK_MARGIN = 1.5  # Safety margin for thread stack recommendations
+
+# RTOS thread/task creation patterns for auto-detection
+# Format: (function_pattern, entry_func_arg_position, stack_size_arg_position)
+RTOS_THREAD_PATTERNS = {
+    'FreeRTOS': [
+        (r'xTaskCreate\s*\(\s*(\w+)', 0, None),
+        (r'xTaskCreateStatic\s*\(\s*(\w+)', 0, None),
+    ],
+    'Zephyr': [
+        (r'k_thread_create\s*\([^,]+,\s*[^,]+,\s*[^,]+,\s*(\w+)', 0, None),
+        (r'K_THREAD_DEFINE\s*\(\s*\w+\s*,\s*\d+\s*,\s*(\w+)', 0, None),
+    ],
+    'CMSIS-RTOS': [
+        (r'osThreadNew\s*\(\s*(\w+)', 0, None),
+        (r'osThreadCreate\s*\([^,]+,\s*(\w+)', 0, None),
+    ],
+    'ThreadX': [
+        (r'tx_thread_create\s*\([^,]+,\s*[^,]+,\s*(\w+)', 0, None),
+    ],
+    'Azure-RTOS': [
+        (r'tx_thread_create\s*\([^,]+,\s*[^,]+,\s*(\w+)', 0, None),
+    ],
+    'embOS': [
+        (r'OS_TASK_Create\s*\([^,]+,\s*[^,]+,\s*(\w+)', 0, None),
+        (r'OS_TASK_CreateEx\s*\([^,]+,\s*[^,]+,\s*(\w+)', 0, None),
+    ],
+    'uC/OS': [
+        (r'OSTaskCreate\s*\(\s*(\w+)', 0, None),
+        (r'OSTaskCreateExt\s*\(\s*(\w+)', 0, None),
+    ],
+    'POSIX': [
+        (r'pthread_create\s*\([^,]+,\s*[^,]+,\s*(\w+)', 0, None),
+    ],
+}
 
 # Data structure for function information
 FunctionInfo = namedtuple('FunctionInfo', [
@@ -65,7 +100,19 @@ FunctionInfo = namedtuple('FunctionInfo', [
     'is_recursive',      # Whether function is recursive
     'is_root',           # Whether function is a root (entry point)
     'is_unbounded',      # Whether function has unbounded stack usage
-    'unbounded_reason'   # Reason for unbounded stack (recursion, function_pointer, etc.)
+    'unbounded_reason',  # Reason for unbounded stack (recursion, function_pointer, etc.)
+    'code_size',         # Function code size in flash (bytes)
+    'static_size'        # Static allocation size in RAM (.data + .bss per file)
+])
+
+# Data structure for detected thread/task information
+ThreadInfo = namedtuple('ThreadInfo', [
+    'entry_func',        # Thread entry function name
+    'rtos',              # Detected RTOS type
+    'source_file',       # Source file where thread was created
+    'stack_usage',       # Calculated stack usage
+    'recommended',       # Recommended stack size (with margin)
+    'is_unbounded'       # Whether stack usage is unbounded
 ])
 
 
@@ -86,7 +133,8 @@ class StackAnalyzer:
             build_dir: str,
             threshold: int = 10,
             show_warnings: bool = True,
-            objdump_path: str = DEFAULT_OBJDUMP):
+            objdump_path: str = DEFAULT_OBJDUMP,
+            stack_margin: float = DEFAULT_STACK_MARGIN):
         """
         Initialize the stack analyzer.
 
@@ -95,11 +143,13 @@ class StackAnalyzer:
             threshold: Minimum stack usage threshold for reporting (bytes)
             show_warnings: Whether to display symbol resolution warnings
             objdump_path: Path to objdump executable
+            stack_margin: Safety margin multiplier for thread stack recommendations
         """
         self.build_dir = Path(build_dir)
         self.threshold = threshold
         self.show_warnings = show_warnings
         self.objdump_path = objdump_path
+        self.stack_margin = stack_margin
         self.logger = logging.getLogger(__name__)
 
         # Core data structures for analysis
@@ -120,8 +170,17 @@ class StackAnalyzer:
         self.has_function_pointer: Set[str] = set()  # Functions with function pointer calls
         self.rtl_available: bool = False  # Whether RTL dumps are available
 
+        # Code size tracking (flash usage)
+        self.code_size: Dict[str, int] = {}  # "func@file" -> code size in bytes
+
+        # Static allocation tracking (RAM usage - .data + .bss per file)
+        self.static_size: Dict[str, int] = {}  # "file.o" -> static size in bytes
+
         # Git repository information
         self.git_info: Dict[str, str] = {}  # Git hash, branch, etc.
+
+        # Thread/task detection
+        self.detected_threads: List[ThreadInfo] = []  # Detected RTOS threads
 
     def find_object_files(self) -> List[str]:
         """
@@ -359,6 +418,8 @@ class StackAnalyzer:
 
             self._parse_disassembly(obj_file)
             self._parse_su_file(obj_file)
+            self._parse_code_sizes(obj_file)
+            self._parse_static_sizes(obj_file)
 
         # Parse RTL dumps for function pointer detection if available
         if self.rtl_available:
@@ -455,6 +516,167 @@ class StackAnalyzer:
         except FileNotFoundError:
             # Stack usage files may not exist for assembly files or system libraries
             pass
+
+    def _parse_code_sizes(self, obj_file: str) -> None:
+        """
+        Parse object file to extract function code sizes using nm.
+
+        Uses arm-none-eabi-nm to get function symbol sizes from object files.
+        This represents the flash/code memory footprint of each function.
+
+        Args:
+            obj_file: Object file path to analyze
+        """
+        # Derive nm path from objdump path
+        nm_path = self.objdump_path.replace('objdump', 'nm')
+
+        try:
+            result = subprocess.run(
+                [nm_path, '--print-size', '--size-sort', obj_file],
+                capture_output=True, text=True, check=True
+            )
+
+            for line in result.stdout.splitlines():
+                # Format: "address size type name"
+                # Example: "00000000 00000124 T main"
+                parts = line.strip().split()
+                if len(parts) >= 4:
+                    addr, size_hex, sym_type, name = parts[0], parts[1], parts[2], parts[3]
+                    # Only count text (code) symbols: T (global) or t (local)
+                    if sym_type in ('T', 't'):
+                        try:
+                            size = int(size_hex, 16)
+                            func_key = f"{name}@{obj_file}"
+                            self.code_size[func_key] = size
+                        except ValueError:
+                            pass
+
+        except subprocess.CalledProcessError:
+            # nm may fail on some object files
+            pass
+        except FileNotFoundError:
+            # nm not available - silently skip
+            pass
+
+    def _parse_static_sizes(self, obj_file: str) -> None:
+        """
+        Parse object file to extract static allocation sizes using nm.
+
+        Uses arm-none-eabi-nm to get .data and .bss symbol sizes from object files.
+        This represents the static RAM footprint (global/static variables).
+
+        Args:
+            obj_file: Object file path to analyze
+        """
+        nm_path = self.objdump_path.replace('objdump', 'nm')
+
+        try:
+            result = subprocess.run(
+                [nm_path, '--print-size', obj_file],
+                capture_output=True, text=True, check=True
+            )
+
+            total_static = 0
+            for line in result.stdout.splitlines():
+                # Format: "address size type name"
+                # D/d = initialized data (.data), B/b = uninitialized data (.bss)
+                parts = line.strip().split()
+                if len(parts) >= 4:
+                    size_hex, sym_type = parts[1], parts[2]
+                    # Count data symbols: D (global data), d (local data),
+                    # B (global bss), b (local bss)
+                    if sym_type in ('D', 'd', 'B', 'b'):
+                        try:
+                            total_static += int(size_hex, 16)
+                        except ValueError:
+                            pass
+
+            if total_static > 0:
+                self.static_size[obj_file] = total_static
+
+        except subprocess.CalledProcessError:
+            pass
+        except FileNotFoundError:
+            pass
+
+    def detect_thread_entries(self) -> None:
+        """
+        Detect RTOS thread/task entry functions by scanning source files.
+
+        Searches for common RTOS task creation patterns (FreeRTOS, Zephyr, etc.)
+        and extracts the thread entry function names for stack analysis.
+        """
+        self.logger.info("🔍 Detecting RTOS thread entry points...")
+
+        # Find all C source files in build directory and parent
+        source_dirs = [self.build_dir]
+        if self.build_dir.parent != self.build_dir:
+            source_dirs.append(self.build_dir.parent)
+
+        source_files = []
+        for src_dir in source_dirs:
+            source_files.extend(glob.glob(str(src_dir / "**/*.c"), recursive=True))
+            source_files.extend(glob.glob(str(src_dir / "**/*.cpp"), recursive=True))
+
+        detected_entries = {}  # entry_func -> (rtos, source_file)
+
+        for source_file in source_files:
+            try:
+                with open(source_file, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+
+                for rtos_name, patterns in RTOS_THREAD_PATTERNS.items():
+                    for pattern, _, _ in patterns:
+                        matches = re.findall(pattern, content)
+                        for match in matches:
+                            entry_func = match if isinstance(match, str) else match[0]
+                            if entry_func and entry_func not in detected_entries:
+                                detected_entries[entry_func] = (rtos_name, source_file)
+
+            except (IOError, OSError):
+                continue
+
+        # Build ThreadInfo for each detected entry
+        for entry_func, (rtos_name, source_file) in detected_entries.items():
+            # Find the function's stack usage
+            stack_usage = 0
+            is_unbounded = False
+
+            # Search for the function in our analyzed data
+            for func_key, cost in self.total_cost.items():
+                func_name = func_key.split('@')[0] if '@' in func_key else func_key
+                if func_name == entry_func:
+                    if cost == float('inf'):
+                        is_unbounded = True
+                        stack_usage = 0
+                    else:
+                        stack_usage = cost
+                    break
+
+            # Calculate recommended size (round up to nearest power of 2 or 256)
+            if is_unbounded:
+                recommended = 0
+            else:
+                with_margin = int(stack_usage * self.stack_margin)
+                # Round up to nearest 256 bytes
+                recommended = ((with_margin + 255) // 256) * 256
+                # Minimum 512 bytes
+                recommended = max(recommended, 512)
+
+            thread_info = ThreadInfo(
+                entry_func=entry_func,
+                rtos=rtos_name,
+                source_file=os.path.basename(source_file),
+                stack_usage=stack_usage,
+                recommended=recommended,
+                is_unbounded=is_unbounded
+            )
+            self.detected_threads.append(thread_info)
+
+        if self.detected_threads:
+            self.logger.info(f"  ✓ Detected {len(self.detected_threads)} thread entry points")
+        else:
+            self.logger.info("  ✓ No RTOS thread patterns detected")
 
     def _parse_rtl_files(self, obj_files: List[str]) -> None:
         """
@@ -733,6 +955,10 @@ class StackAnalyzer:
                 elif func_full_name.startswith("main@"):
                     main_cost = cost
 
+            # Get static size for this file
+            obj_file_path = func_full_name.split('@')[1] if '@' in func_full_name else ''
+            file_static_size = self.static_size.get(obj_file_path, 0)
+
             func_info = FunctionInfo(
                 name=display_name,
                 cost=cost,
@@ -741,7 +967,9 @@ class StackAnalyzer:
                 is_recursive=is_recursive,
                 is_root=is_root,
                 is_unbounded=is_unbounded,
-                unbounded_reason=unbounded_reason
+                unbounded_reason=unbounded_reason,
+                code_size=self.code_size.get(func_full_name, 0),
+                static_size=file_static_size
             )
 
             functions.append(func_info)
@@ -758,6 +986,7 @@ class StackAnalyzer:
         self._print_function_table(functions)
         self._print_summary(main_cost, max_iv_cost)
         self._print_unresolved()
+        self._print_thread_recommendations()
 
         # Return data for potential JSON export
         return self._build_analysis_data(functions, file_stats, main_cost, max_iv_cost)
@@ -822,6 +1051,10 @@ class StackAnalyzer:
                 elif func_full_name.startswith("main@"):
                     main_cost = cost
 
+            # Get static size for this file
+            obj_file_path = func_full_name.split('@')[1] if '@' in func_full_name else ''
+            file_static_size = self.static_size.get(obj_file_path, 0)
+
             func_info = FunctionInfo(
                 name=display_name,
                 cost=cost,
@@ -830,7 +1063,9 @@ class StackAnalyzer:
                 is_recursive=is_recursive,
                 is_root=is_root,
                 is_unbounded=is_unbounded,
-                unbounded_reason=unbounded_reason
+                unbounded_reason=unbounded_reason,
+                code_size=self.code_size.get(func_full_name, 0),
+                static_size=file_static_size
             )
 
             functions.append(func_info)
@@ -912,7 +1147,11 @@ class StackAnalyzer:
                 'max_interrupt_cost': max_iv_cost,
                 'total_peak_estimate': main_cost + max_iv_cost,
                 'max_single_function': max((f.cost for f in functions), default=0),
-                'average_stack_usage': sum(f.cost for f in functions) // len(functions) if functions else 0
+                'average_stack_usage': sum(f.cost for f in functions) // len(functions) if functions else 0,
+                'total_code_size': sum(f.code_size for f in functions),
+                'max_code_size': max((f.code_size for f in functions), default=0),
+                'total_static_size': sum(self.static_size.values()),
+                'files_with_static': len(self.static_size)
             },
             'functions': [
                 {
@@ -923,7 +1162,9 @@ class StackAnalyzer:
                     'is_recursive': func.is_recursive,
                     'is_root': func.is_root,
                     'is_unbounded': func.is_unbounded,
-                    'unbounded_reason': func.unbounded_reason
+                    'unbounded_reason': func.unbounded_reason,
+                    'code_size': func.code_size,
+                    'static_size': func.static_size
                 }
                 for func in functions if func.cost > 0 or func.is_unbounded
             ],
@@ -940,6 +1181,17 @@ class StackAnalyzer:
                 for filename, stats in file_stats.items()
                 if stats['total_cost'] > 0
             },
+            'threads': [
+                {
+                    'entry_func': t.entry_func,
+                    'rtos': t.rtos,
+                    'source_file': t.source_file,
+                    'stack_usage': t.stack_usage if not t.is_unbounded else 'unbounded',
+                    'recommended': t.recommended if not t.is_unbounded else 'unbounded',
+                    'is_unbounded': t.is_unbounded
+                }
+                for t in self.detected_threads
+            ],
             'unresolved': sorted(list(self.unresolved))
         }
 
@@ -992,14 +1244,16 @@ class StackAnalyzer:
         print(f"{Colors.CYAN}{threshold_msg}{Colors.END}")
         frame_msg = "   Total = Frame + Max(Callees), Frame = Local variables, Depth = Call chain length"
         print(f"{Colors.CYAN}{frame_msg}{Colors.END}")
+        flash_msg = "   Flash = Code size, Static = .data+.bss per source file"
+        print(f"{Colors.CYAN}{flash_msg}{Colors.END}")
         symbols_msg = "   Symbols: ▶=Root, 🔄=Recursive, ⚠=Function pointer, ❌=Unbounded"
         print(f"{Colors.CYAN}{symbols_msg}{Colors.END}\n")
 
         # Table header with proper alignment
-        header = f"{'Flag':<5}{'Function Name':<40} {'Total':<9} {'Frame':<7} {'Depth':<5}"
+        header = f"{'Flag':<5}{'Function Name':<40} {'Total':<9} {'Frame':<7} {'Depth':<6} {'Flash':<7} {'Static':<7}"
         print(f"{Colors.BOLD}{Colors.UNDERLINE}{header}{Colors.END}")
         separator = (f"{'─────':<5}{'────────────────────────────────────────':<40} "
-                     f"{'─────────':<9} {'─────':<7} {'─────':<5}")
+                     f"{'─────────':<9} {'─────':<7} {'─────':<6} {'─────':<7} {'──────':<7}")
         print(f"{Colors.BOLD}{Colors.UNDERLINE}{separator}{Colors.END}")
 
         # Display function rows
@@ -1062,9 +1316,15 @@ class StackAnalyzer:
         # Handle unbounded depth display
         depth_display = str(func.height) if func.height != float('inf') else "∞"
 
+        # Handle flash/code size display
+        flash_display = str(func.code_size) if func.code_size > 0 else "-"
+
+        # Handle static allocation display
+        static_display = str(func.static_size) if func.static_size > 0 else "-"
+
         # Print formatted row with consistent alignment
         row = (f"{flag}{display_name:<40} {cost_display:<9} {func.frame_size:<7} "
-               f"{depth_display:<5}")
+               f"{depth_display:<6} {flash_display:<7} {static_display:<7}")
         print(row)
 
     def _print_summary(self, main_cost: int, max_iv_cost: int) -> None:
@@ -1098,10 +1358,27 @@ class StackAnalyzer:
         # Additional statistics
         all_costs = list(self.total_cost.values())
         if all_costs:
-            print("\n📈 Statistics:")
+            print("\n📈 Stack Statistics:")
             print(f"   Functions analyzed:     {Colors.CYAN}{len(all_costs):>6}{Colors.END}")
             print(f"   Average stack usage:    {Colors.YELLOW}{sum(all_costs)//len(all_costs):>6}{Colors.END} bytes")
             print(f"   Maximum single function:{Colors.RED}{max(all_costs):>6}{Colors.END} bytes")
+
+        # Flash/code size statistics
+        all_code_sizes = [s for s in self.code_size.values() if s > 0]
+        if all_code_sizes:
+            total_flash = sum(all_code_sizes)
+            print("\n💾 Flash Statistics:")
+            print(f"   Functions with code:    {Colors.CYAN}{len(all_code_sizes):>6}{Colors.END}")
+            print(f"   Total code size:        {Colors.YELLOW}{total_flash:>6}{Colors.END} bytes")
+            print(f"   Largest function:       {Colors.RED}{max(all_code_sizes):>6}{Colors.END} bytes")
+
+        # Static allocation statistics (.data + .bss)
+        if self.static_size:
+            total_static = sum(self.static_size.values())
+            print("\n🗄️  Static RAM Statistics (.data + .bss):")
+            print(f"   Files with static data: {Colors.CYAN}{len(self.static_size):>6}{Colors.END}")
+            print(f"   Total static size:      {Colors.YELLOW}{total_static:>6}{Colors.END} bytes")
+            print(f"   Largest file:           {Colors.RED}{max(self.static_size.values()):>6}{Colors.END} bytes")
 
     def _print_unresolved(self) -> None:
         """
@@ -1123,6 +1400,57 @@ class StackAnalyzer:
                 elif i == 20:
                     print(f"   • ... and {len(sorted_unresolved) - 20} more")
                     break
+
+    def _print_thread_recommendations(self) -> None:
+        """
+        Display thread stack size recommendations.
+
+        Shows detected RTOS threads with their calculated stack usage
+        and recommended stack sizes including safety margin.
+        """
+        if not self.detected_threads:
+            return
+
+        print(f"\n{Colors.BOLD}{Colors.HEADER}🧵 THREAD STACK RECOMMENDATIONS{Colors.END}")
+        print("─" * 60)
+        print(f"{Colors.CYAN}Safety margin: {self.stack_margin:.1f}x "
+              f"(configure with --stack-margin){Colors.END}\n")
+
+        # Table header
+        header = f"{'Thread Entry':<30} {'RTOS':<12} {'Calculated':<12} {'Recommended':<12}"
+        print(f"{Colors.BOLD}{Colors.UNDERLINE}{header}{Colors.END}")
+        separator = f"{'─' * 30:<30} {'─' * 12:<12} {'─' * 12:<12} {'─' * 12:<12}"
+        print(f"{Colors.BOLD}{Colors.UNDERLINE}{separator}{Colors.END}")
+
+        # Sort by recommended size descending
+        sorted_threads = sorted(self.detected_threads,
+                               key=lambda t: t.recommended, reverse=True)
+
+        for thread in sorted_threads:
+            name = thread.entry_func
+            if len(name) > 29:
+                name = name[:26] + "..."
+
+            if thread.is_unbounded:
+                calc_str = f"{Colors.RED}unbounded{Colors.END}"
+                rec_str = f"{Colors.RED}REVIEW!{Colors.END}"
+            else:
+                calc_str = f"{thread.stack_usage}"
+                rec_str = f"{Colors.GREEN}{thread.recommended}{Colors.END}"
+
+            print(f"{name:<30} {thread.rtos:<12} {calc_str:<12} {rec_str:<12}")
+
+        # Summary
+        bounded_threads = [t for t in self.detected_threads if not t.is_unbounded]
+        if bounded_threads:
+            total_recommended = sum(t.recommended for t in bounded_threads)
+            print(f"\n{Colors.BOLD}Total recommended stack space: "
+                  f"{Colors.GREEN}{total_recommended}{Colors.END}{Colors.BOLD} bytes{Colors.END}")
+
+        unbounded_count = len([t for t in self.detected_threads if t.is_unbounded])
+        if unbounded_count > 0:
+            print(f"{Colors.YELLOW}⚠️  {unbounded_count} thread(s) have unbounded stack - "
+                  f"manual review required{Colors.END}")
 
     def export_json(self, output_file: str, data: Dict) -> None:
         """
@@ -1463,9 +1791,10 @@ Examples:
   python3 arm-stack --compare old.json new.json
   python3 arm-stack --read-json analysis.json
   python3 arm-stack --read-json analysis.json --threshold 100
-  python3 arm-stack --read-json analysis.json --threshold 50 --json
-  python3 arm-stack --read-json analysis.json --short
-  python3 arm-stack --filter-json analysis.json --threshold 100  # deprecated
+
+Thread Stack Analysis (auto-detects FreeRTOS, Zephyr, CMSIS-RTOS, etc.):
+  python3 arm-stack build --threads
+  python3 arm-stack build --threads --stack-margin 2.0
 
 Function Pointer Detection:
   Compile with: gcc -c -fstack-usage -fdump-rtl-dfinish source.c
@@ -1494,6 +1823,11 @@ Function Pointer Detection:
         type=str,
         metavar='FILE',
         help='Read JSON file and filter functions by stack usage threshold (deprecated: use --read-json)')
+    parser.add_argument('--threads', action='store_true',
+                        help='Detect RTOS thread entry points and recommend stack sizes')
+    parser.add_argument('--stack-margin', type=float, default=DEFAULT_STACK_MARGIN,
+                        metavar='FACTOR',
+                        help=f'Safety margin multiplier for thread stack recommendations (default: {DEFAULT_STACK_MARGIN})')
     parser.add_argument('--version', action='version', version=f'%(prog)s {__version__} by {__author__} ({__github__})')
 
     args = parser.parse_args()
@@ -1581,7 +1915,13 @@ Function Pointer Detection:
         print()
 
     # Initialize and run analysis
-    analyzer = StackAnalyzer(args.build_dir, args.threshold, not args.no_warnings, args.objdump)
+    analyzer = StackAnalyzer(
+        args.build_dir,
+        args.threshold,
+        not args.no_warnings,
+        args.objdump,
+        args.stack_margin
+    )
 
     try:
         # Verification and setup phase
@@ -1592,6 +1932,10 @@ Function Pointer Detection:
         analyzer.resolve_symbols()
         analyzer.create_interrupt_node()
         analyzer.trace_call_graph()
+
+        # Detect thread entry points if requested
+        if args.threads:
+            analyzer.detect_thread_entries()
 
         if args.json:
             # JSON mode: generate data and output to stdout

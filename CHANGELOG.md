@@ -5,6 +5,23 @@ All notable changes to the ARM Stack Usage Analyzer will be documented in this f
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2025-12-22
+
+### Added
+- RTOS thread stack optimizer with `--threads` option
+- Auto-detection of thread entry points for FreeRTOS, Zephyr, CMSIS-RTOS, ThreadX, embOS, uC/OS, POSIX
+- Thread stack size recommendations with configurable safety margin (`--stack-margin`)
+- Static RAM allocation tracking (.data + .bss per source file)
+- Flash/code size analysis per function using `arm-none-eabi-nm`
+- New "Flash" and "Static" columns in function table output
+- Flash and static RAM statistics in summary section
+- Thread recommendations in JSON export
+
+### Changed
+- Updated function table to show Flash and Static columns
+- Enhanced JSON export with code_size, static_size, and threads data
+- Summary now includes flash and static RAM statistics
+
 ## [1.2.0] - 2025-06-23
 
 ### Added
@@ -99,6 +116,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Filters out CMake compiler identification files
 - Supports glob patterns for recursive file discovery
 
+[1.5.0]: https://github.com/wizath/arm-stack/compare/v1.2.0...v1.5.0
 [1.2.0]: https://github.com/wizath/arm-stack/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/wizath/arm-stack/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/wizath/arm-stack/releases/tag/v1.0.0 
