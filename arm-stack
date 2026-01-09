@@ -17,7 +17,7 @@ Requirements:
 Author: wizath
 GitHub: https://github.com/wizath
 License: MIT
-Version: 1.5
+Version: 1.6
 """
 
 import sys
@@ -34,7 +34,7 @@ from pathlib import Path
 from datetime import datetime
 
 # Version information
-__version__ = "1.5"
+__version__ = "1.6"
 __author__ = "wizath"
 __github__ = "https://github.com/wizath"
 
@@ -56,6 +56,9 @@ class Colors:
 DEFAULT_OBJDUMP = "arm-none-eabi-objdump"
 CALL_COST = 4  # ARM function call overhead in bytes
 DEFAULT_STACK_MARGIN = 1.5  # Safety margin for thread stack recommendations
+SUBPROCESS_TIMEOUT = 60  # Timeout for subprocess calls in seconds
+MAX_UNRESOLVED_DISPLAY = 20  # Maximum unresolved functions to display
+MAX_FUNCTION_NAME_LEN = 39  # Maximum function name length before truncation
 
 # RTOS thread/task creation patterns for auto-detection
 # Format: (function_pattern, entry_func_arg_position, stack_size_arg_position)
@@ -172,6 +175,8 @@ class StackAnalyzer:
 
         # Code size tracking (flash usage)
         self.code_size: Dict[str, int] = {}  # "func@file" -> code size in bytes
+        self.elf_code_size: Dict[str, int] = {}  # "func_name" -> linked code size from ELF
+        self.elf_file: Optional[str] = None  # Path to ELF file for linked sizes
 
         # Static allocation tracking (RAM usage - .data + .bss per file)
         self.static_size: Dict[str, int] = {}  # "file.o" -> static size in bytes
@@ -262,7 +267,8 @@ class StackAnalyzer:
         try:
             # Check if we're in a git repository
             result = subprocess.run(['git', 'rev-parse', '--is-inside-work-tree'],
-                                    capture_output=True, text=True, cwd=os.getcwd())
+                                    capture_output=True, text=True, cwd=os.getcwd(),
+                                    timeout=SUBPROCESS_TIMEOUT)
 
             if result.returncode != 0:
                 self.logger.debug("Not in a git repository")
@@ -270,44 +276,51 @@ class StackAnalyzer:
 
             # Get commit hash (full)
             result = subprocess.run(['git', 'rev-parse', 'HEAD'],
-                                    capture_output=True, text=True, cwd=os.getcwd())
+                                    capture_output=True, text=True, cwd=os.getcwd(),
+                                    timeout=SUBPROCESS_TIMEOUT)
             if result.returncode == 0:
                 self.git_info['commit_hash'] = result.stdout.strip()
                 self.git_info['commit_hash_short'] = result.stdout.strip()[:8]
 
             # Get current branch name
             result = subprocess.run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
-                                    capture_output=True, text=True, cwd=os.getcwd())
+                                    capture_output=True, text=True, cwd=os.getcwd(),
+                                    timeout=SUBPROCESS_TIMEOUT)
             if result.returncode == 0:
                 self.git_info['branch'] = result.stdout.strip()
 
             # Check if repository is clean
             result = subprocess.run(['git', 'status', '--porcelain'],
-                                    capture_output=True, text=True, cwd=os.getcwd())
+                                    capture_output=True, text=True, cwd=os.getcwd(),
+                                    timeout=SUBPROCESS_TIMEOUT)
             if result.returncode == 0:
                 self.git_info['is_clean'] = len(result.stdout.strip()) == 0
                 self.git_info['status'] = 'clean' if self.git_info['is_clean'] else 'dirty'
 
             # Get remote origin URL (if available)
             result = subprocess.run(['git', 'remote', 'get-url', 'origin'],
-                                    capture_output=True, text=True, cwd=os.getcwd())
+                                    capture_output=True, text=True, cwd=os.getcwd(),
+                                    timeout=SUBPROCESS_TIMEOUT)
             if result.returncode == 0:
                 self.git_info['remote_url'] = result.stdout.strip()
 
             # Get commit message (first line)
             result = subprocess.run(['git', 'log', '-1', '--pretty=format:%s'],
-                                    capture_output=True, text=True, cwd=os.getcwd())
+                                    capture_output=True, text=True, cwd=os.getcwd(),
+                                    timeout=SUBPROCESS_TIMEOUT)
             if result.returncode == 0:
                 self.git_info['commit_message'] = result.stdout.strip()
 
             # Get commit author and date
             result = subprocess.run(['git', 'log', '-1', '--pretty=format:%an'],
-                                    capture_output=True, text=True, cwd=os.getcwd())
+                                    capture_output=True, text=True, cwd=os.getcwd(),
+                                    timeout=SUBPROCESS_TIMEOUT)
             if result.returncode == 0:
                 self.git_info['commit_author'] = result.stdout.strip()
 
             result = subprocess.run(['git', 'log', '-1', '--pretty=format:%ci'],
-                                    capture_output=True, text=True, cwd=os.getcwd())
+                                    capture_output=True, text=True, cwd=os.getcwd(),
+                                    timeout=SUBPROCESS_TIMEOUT)
             if result.returncode == 0:
                 self.git_info['commit_date'] = result.stdout.strip()
 
@@ -346,10 +359,11 @@ class StackAnalyzer:
 
         # Verify ARM toolchain availability
         try:
-            subprocess.run([self.objdump_path, "--version"], capture_output=True, check=True)
+            subprocess.run([self.objdump_path, "--version"], capture_output=True, check=True,
+                           timeout=SUBPROCESS_TIMEOUT)
             self.logger.info(f"  ✓ {self.objdump_path} found")
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            error_msg = (f"{Colors.RED}❌ Error: {self.objdump_path} not found. "
+        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+            error_msg = (f"{Colors.RED}❌ Error: {self.objdump_path} not found or timed out. "
                          f"Please install ARM GCC toolchain or specify correct path with --objdump.{Colors.END}")
             print(error_msg)
             sys.exit(1)
@@ -444,7 +458,8 @@ class StackAnalyzer:
         """
         try:
             result = subprocess.run([self.objdump_path, "-dr", obj_file],
-                                    capture_output=True, text=True, check=True)
+                                    capture_output=True, text=True, check=True,
+                                    timeout=SUBPROCESS_TIMEOUT)
 
             current_function = None
 
@@ -481,7 +496,7 @@ class StackAnalyzer:
 
                     self.call_graph[current_function].add(target)
 
-        except subprocess.CalledProcessError as e:
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
             print(f"{Colors.RED}❌ Error disassembling {obj_file}: {e}{Colors.END}")
             sys.exit(1)
 
@@ -519,26 +534,41 @@ class StackAnalyzer:
 
     def _parse_code_sizes(self, obj_file: str) -> None:
         """
-        Parse object file to extract function code sizes using nm.
+        REMOVED: Object file code sizes are meaningless (include dead code).
+        Use --elf option to get accurate linked code sizes.
+        """
+        # Object file sizes are misleading - skip entirely
+        # Users must provide --elf for code size statistics
+        pass
 
-        Uses arm-none-eabi-nm to get function symbol sizes from object files.
-        This represents the flash/code memory footprint of each function.
+    def parse_elf_code_sizes(self, elf_file: str) -> None:
+        """
+        Parse ELF file to extract actual linked function code sizes.
+
+        This gives accurate flash usage after LTO and dead code elimination.
+        Much more accurate than object file sizes.
 
         Args:
-            obj_file: Object file path to analyze
+            elf_file: Path to linked ELF file
         """
-        # Derive nm path from objdump path
+        self.elf_file = elf_file
         nm_path = self.objdump_path.replace('objdump', 'nm')
+
+        self.logger.info(f"📦 Parsing ELF file for code sizes: {elf_file}")
 
         try:
             result = subprocess.run(
-                [nm_path, '--print-size', '--size-sort', obj_file],
-                capture_output=True, text=True, check=True
+                [nm_path, '--print-size', elf_file],
+                capture_output=True, text=True, check=True,
+                timeout=SUBPROCESS_TIMEOUT
             )
+
+            func_count = 0
+            total_size = 0
 
             for line in result.stdout.splitlines():
                 # Format: "address size type name"
-                # Example: "00000000 00000124 T main"
+                # Example: "08001234 00000124 T main"
                 parts = line.strip().split()
                 if len(parts) >= 4:
                     addr, size_hex, sym_type, name = parts[0], parts[1], parts[2], parts[3]
@@ -546,17 +576,18 @@ class StackAnalyzer:
                     if sym_type in ('T', 't'):
                         try:
                             size = int(size_hex, 16)
-                            func_key = f"{name}@{obj_file}"
-                            self.code_size[func_key] = size
+                            self.elf_code_size[name] = size
+                            func_count += 1
+                            total_size += size
                         except ValueError:
                             pass
 
-        except subprocess.CalledProcessError:
-            # nm may fail on some object files
-            pass
+            self.logger.info(f"  ✓ Found {func_count} functions, {total_size/1024:.1f} KB total code")
+
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            self.logger.warning(f"⚠️ Failed to parse ELF: {e}")
         except FileNotFoundError:
-            # nm not available - silently skip
-            pass
+            self.logger.warning(f"⚠️ nm not found or ELF file missing")
 
     def _parse_static_sizes(self, obj_file: str) -> None:
         """
@@ -573,7 +604,8 @@ class StackAnalyzer:
         try:
             result = subprocess.run(
                 [nm_path, '--print-size', obj_file],
-                capture_output=True, text=True, check=True
+                capture_output=True, text=True, check=True,
+                timeout=SUBPROCESS_TIMEOUT
             )
 
             total_static = 0
@@ -594,7 +626,7 @@ class StackAnalyzer:
             if total_static > 0:
                 self.static_size[obj_file] = total_static
 
-        except subprocess.CalledProcessError:
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             pass
         except FileNotFoundError:
             pass
@@ -833,14 +865,16 @@ class StackAnalyzer:
         The algorithm handles cycles by detecting when a function is revisited
         during traversal and marking it as recursive.
         """
-        self.logger.info("📊 Analyzing call graph...")
+        self.logger.info("�� Analyzing call graph...")
 
         def trace(func_name: str) -> None:
             """Recursive traversal function with cycle detection"""
             if func_name in self.visited:
                 if self.visited[func_name] == "?":
-                    # Cycle detected - mark as recursive
+                    # Cycle detected - mark as recursive with unbounded stack
                     self.visited[func_name] = "R"
+                    self.total_cost[func_name] = float('inf')
+                    self.call_depth[func_name] = float('inf')
                 return
 
             # Mark as currently being processed
@@ -888,21 +922,23 @@ class StackAnalyzer:
         for func_name in self.call_graph:
             trace(func_name)
 
-    def generate_report(self) -> None:
-        """
-        Generate and display comprehensive stack usage analysis report.
+    def _get_code_size(self, func_full_name: str) -> int:
+        """Get code size for a function, preferring ELF (linked) over object file."""
+        if self.elf_code_size:
+            # Use ELF code size (by function name, not full path)
+            base_name = func_full_name.split('@')[0] if '@' in func_full_name else func_full_name
+            return self.elf_code_size.get(base_name, 0)
+        else:
+            # Fallback to object file code size
+            return self.code_size.get(func_full_name, 0)
 
-        The report includes:
-        - File-based stack usage summary
-        - Detailed function table with costs and depths
-        - Peak stack usage estimates
-        - Unresolved function warnings
+    def _prepare_function_data(self) -> tuple:
         """
-        print(f"\n{Colors.BOLD}{Colors.HEADER}{'='*80}{Colors.END}")
-        print(f"{Colors.BOLD}{Colors.HEADER}📈 STACK USAGE ANALYSIS REPORT{Colors.END}")
-        print(f"{Colors.BOLD}{Colors.HEADER}{'='*80}{Colors.END}\n")
+        Prepare function data and file statistics for reporting.
 
-        # Prepare function data and file statistics
+        Returns:
+            Tuple of (functions, file_stats, main_cost, max_iv_cost)
+        """
         functions = []
         file_stats = defaultdict(lambda: {'count': 0, 'total_cost': 0, 'max_cost': 0, 'functions': []})
         max_iv_cost = 0
@@ -911,19 +947,18 @@ class StackAnalyzer:
         for func_full_name in sorted(self.total_cost.keys(),
                                      key=lambda x: self.total_cost[x], reverse=True):
 
-            # Extract clean function name and source file
+            # Extract clean function name and source file using partition for efficiency
             display_name = func_full_name
             source_file = "unknown"
 
             if '@' in func_full_name:
-                base_name = func_full_name.split('@')[0]
-                obj_file = func_full_name.split('@')[1]
+                base_name, _, obj_file = func_full_name.partition('@')
 
                 # Extract source file name from object file path
                 if '/' in obj_file:
-                    source_file = os.path.basename(obj_file).replace('.o', '')
+                    source_file = os.path.basename(obj_file).replace('.c.obj', '.c').replace('.o', '')
                 else:
-                    source_file = obj_file.replace('.o', '')
+                    source_file = obj_file.replace('.c.obj', '.c').replace('.o', '')
 
                 # Use clean name if not ambiguous
                 if base_name not in self.ambiguous:
@@ -956,7 +991,7 @@ class StackAnalyzer:
                     main_cost = cost
 
             # Get static size for this file
-            obj_file_path = func_full_name.split('@')[1] if '@' in func_full_name else ''
+            _, _, obj_file_path = func_full_name.partition('@')
             file_static_size = self.static_size.get(obj_file_path, 0)
 
             func_info = FunctionInfo(
@@ -968,7 +1003,7 @@ class StackAnalyzer:
                 is_root=is_root,
                 is_unbounded=is_unbounded,
                 unbounded_reason=unbounded_reason,
-                code_size=self.code_size.get(func_full_name, 0),
+                code_size=self._get_code_size(func_full_name),
                 static_size=file_static_size
             )
 
@@ -980,6 +1015,25 @@ class StackAnalyzer:
                 file_stats[source_file]['total_cost'] += cost
                 file_stats[source_file]['max_cost'] = max(file_stats[source_file]['max_cost'], cost)
                 file_stats[source_file]['functions'].append((display_name, cost, is_root))
+
+        return functions, file_stats, main_cost, max_iv_cost
+
+    def generate_report(self) -> Dict:
+        """
+        Generate and display comprehensive stack usage analysis report.
+
+        The report includes:
+        - File-based stack usage summary
+        - Detailed function table with costs and depths
+        - Peak stack usage estimates
+        - Unresolved function warnings
+        """
+        print(f"\n{Colors.BOLD}{Colors.HEADER}{'='*80}{Colors.END}")
+        print(f"{Colors.BOLD}{Colors.HEADER}📈 STACK USAGE ANALYSIS REPORT{Colors.END}")
+        print(f"{Colors.BOLD}{Colors.HEADER}{'='*80}{Colors.END}\n")
+
+        # Prepare function data and file statistics
+        functions, file_stats, main_cost, max_iv_cost = self._prepare_function_data()
 
         # Generate report sections
         self._print_file_hierarchy(file_stats)
@@ -998,85 +1052,7 @@ class StackAnalyzer:
         Returns:
             Analysis data dictionary
         """
-        # Prepare function data and file statistics (same logic as generate_report)
-        functions = []
-        file_stats = defaultdict(lambda: {'count': 0, 'total_cost': 0, 'max_cost': 0, 'functions': []})
-        max_iv_cost = 0
-        main_cost = 0
-
-        for func_full_name in sorted(self.total_cost.keys(),
-                                     key=lambda x: self.total_cost[x], reverse=True):
-
-            # Extract clean function name and source file
-            display_name = func_full_name
-            source_file = "unknown"
-
-            if '@' in func_full_name:
-                base_name = func_full_name.split('@')[0]
-                obj_file = func_full_name.split('@')[1]
-
-                # Extract source file name from object file path
-                if '/' in obj_file:
-                    source_file = os.path.basename(obj_file).replace('.o', '').replace('.c.obj', '.cbj')
-                else:
-                    source_file = obj_file.replace('.o', '').replace('.c.obj', '.cbj')
-
-                # Use clean name if not ambiguous
-                if base_name not in self.ambiguous:
-                    display_name = base_name
-
-            # Determine function characteristics
-            visit_status = self.visited.get(func_full_name, ' ')
-            is_recursive = visit_status == 'R'
-            is_root = func_full_name not in self.has_caller
-            cost = self.total_cost[func_full_name]
-
-            # Determine unbounded status and reason
-            is_unbounded = cost == float('inf')
-            unbounded_reason = None
-            if is_unbounded:
-                if visit_status == 'R':
-                    unbounded_reason = 'recursion'
-                elif visit_status == 'P':
-                    unbounded_reason = 'function_pointer'
-                elif visit_status == 'U':
-                    unbounded_reason = 'unbounded_callee'
-                else:
-                    unbounded_reason = 'unknown'
-
-            # Track special functions for summary (skip unbounded functions)
-            if not is_unbounded:
-                if "__vector_" in func_full_name:
-                    max_iv_cost = max(max_iv_cost, cost)
-                elif func_full_name.startswith("main@"):
-                    main_cost = cost
-
-            # Get static size for this file
-            obj_file_path = func_full_name.split('@')[1] if '@' in func_full_name else ''
-            file_static_size = self.static_size.get(obj_file_path, 0)
-
-            func_info = FunctionInfo(
-                name=display_name,
-                cost=cost,
-                frame_size=self.frame_size.get(func_full_name, 0),
-                height=self.call_depth.get(func_full_name, 0),
-                is_recursive=is_recursive,
-                is_root=is_root,
-                is_unbounded=is_unbounded,
-                unbounded_reason=unbounded_reason,
-                code_size=self.code_size.get(func_full_name, 0),
-                static_size=file_static_size
-            )
-
-            functions.append(func_info)
-
-            # Update file statistics
-            if cost > 0:
-                file_stats[source_file]['count'] += 1
-                file_stats[source_file]['total_cost'] += cost
-                file_stats[source_file]['max_cost'] = max(file_stats[source_file]['max_cost'], cost)
-                file_stats[source_file]['functions'].append((display_name, cost, is_root))
-
+        functions, file_stats, main_cost, max_iv_cost = self._prepare_function_data()
         return self._build_analysis_data(functions, file_stats, main_cost, max_iv_cost)
 
     def generate_short_report(self) -> None:
@@ -1133,7 +1109,9 @@ class StackAnalyzer:
             'threshold': self.threshold,
             'total_functions': len(functions),
             'functions_analyzed': len([f for f in functions if f.cost > 0]),
-            'rtl_analysis_enabled': self.rtl_available
+            'rtl_analysis_enabled': self.rtl_available,
+            'code_size_source': 'elf' if self.elf_file else 'object_files',
+            'elf_file': self.elf_file
         }
 
         # Add git information if available
@@ -1148,8 +1126,8 @@ class StackAnalyzer:
                 'total_peak_estimate': main_cost + max_iv_cost,
                 'max_single_function': max((f.cost for f in functions), default=0),
                 'average_stack_usage': sum(f.cost for f in functions) // len(functions) if functions else 0,
-                'total_code_size': sum(f.code_size for f in functions),
-                'max_code_size': max((f.code_size for f in functions), default=0),
+                'total_code_size': sum(self.elf_code_size.values()) if self.elf_code_size else None,
+                'max_code_size': max(self.elf_code_size.values()) if self.elf_code_size else None,
                 'total_static_size': sum(self.static_size.values()),
                 'files_with_static': len(self.static_size)
             },
@@ -1310,8 +1288,8 @@ class StackAnalyzer:
 
         # Handle long function names
         display_name = func.name
-        if len(display_name) > 39:
-            display_name = display_name[:36] + "..."
+        if len(display_name) > MAX_FUNCTION_NAME_LEN:
+            display_name = display_name[:MAX_FUNCTION_NAME_LEN - 3] + "..."
 
         # Handle unbounded depth display
         depth_display = str(func.height) if func.height != float('inf') else "∞"
@@ -1363,14 +1341,16 @@ class StackAnalyzer:
             print(f"   Average stack usage:    {Colors.YELLOW}{sum(all_costs)//len(all_costs):>6}{Colors.END} bytes")
             print(f"   Maximum single function:{Colors.RED}{max(all_costs):>6}{Colors.END} bytes")
 
-        # Flash/code size statistics
-        all_code_sizes = [s for s in self.code_size.values() if s > 0]
-        if all_code_sizes:
+        # Flash/code size statistics (only with ELF)
+        if self.elf_code_size:
+            all_code_sizes = [s for s in self.elf_code_size.values() if s > 0]
             total_flash = sum(all_code_sizes)
-            print("\n💾 Flash Statistics:")
+            print(f"\n💾 Flash Statistics (from ELF):")
             print(f"   Functions with code:    {Colors.CYAN}{len(all_code_sizes):>6}{Colors.END}")
-            print(f"   Total code size:        {Colors.YELLOW}{total_flash:>6}{Colors.END} bytes")
+            print(f"   Total code size:        {Colors.YELLOW}{total_flash:>6}{Colors.END} bytes ({total_flash/1024:.1f} KB)")
             print(f"   Largest function:       {Colors.RED}{max(all_code_sizes):>6}{Colors.END} bytes")
+        else:
+            print(f"\n💾 Flash Statistics: {Colors.YELLOW}Not available (use --elf for code sizes){Colors.END}")
 
         # Static allocation statistics (.data + .bss)
         if self.static_size:
@@ -1395,10 +1375,10 @@ class StackAnalyzer:
             # Display limited list to avoid overwhelming output
             sorted_unresolved = sorted(self.unresolved)
             for i, func in enumerate(sorted_unresolved):
-                if i < 20:
+                if i < MAX_UNRESOLVED_DISPLAY:
                     print(f"   • {func}")
-                elif i == 20:
-                    print(f"   • ... and {len(sorted_unresolved) - 20} more")
+                elif i == MAX_UNRESOLVED_DISPLAY:
+                    print(f"   • ... and {len(sorted_unresolved) - MAX_UNRESOLVED_DISPLAY} more")
                     break
 
     def _print_thread_recommendations(self) -> None:
@@ -1604,8 +1584,8 @@ def read_and_display_json(json_file: str, threshold: int = 0, output_format: str
 
             # Handle long function names
             display_name = func['name']
-            if len(display_name) > 39:
-                display_name = display_name[:36] + "..."
+            if len(display_name) > MAX_FUNCTION_NAME_LEN:
+                display_name = display_name[:MAX_FUNCTION_NAME_LEN - 3] + "..."
 
             depth_display = str(func.get('call_depth', 0)) if func.get('call_depth') != 'unbounded' else "∞"
 
@@ -1740,7 +1720,7 @@ def _print_summary_diff(label: str, old_val: int, new_val: int) -> None:
 def _print_function_diff(func_name: str, old_cost: int, new_cost: int, diff: int, status: str) -> None:
     """Print a function difference in git-diff style."""
     # Truncate long function names
-    display_name = func_name[:39] + "..." if len(func_name) > 39 else func_name
+    display_name = func_name[:MAX_FUNCTION_NAME_LEN - 3] + "..." if len(func_name) > MAX_FUNCTION_NAME_LEN else func_name
 
     if status == 'added':
         add_msg = (f"{Colors.GREEN}+ ADD   {Colors.END} {display_name:<40} {'-':<7} "
@@ -1780,11 +1760,13 @@ def main():
         epilog="""
 Examples:
   python3 arm-stack build
+  python3 arm-stack build --elf build/firmware.elf    # Use ELF for accurate code sizes
   python3 arm-stack cmake-build-debug
   python3 arm-stack build --threshold 50
   python3 arm-stack build --no-color
   python3 arm-stack build --no-warnings
   python3 arm-stack build --export-json stack_usage.json
+  python3 arm-stack build --elf build/fw.elf --export-json usage.json
   python3 arm-stack build --json > stack_usage.json
   python3 arm-stack build --short
   python3 arm-stack build --objdump /path/to/arm-none-eabi-objdump
@@ -1802,6 +1784,8 @@ Function Pointer Detection:
         """
     )
     parser.add_argument('build_dir', nargs='?', help='Build directory containing object files')
+    parser.add_argument('--elf', type=str, metavar='FILE',
+                        help='ELF file to get actual linked code sizes (more accurate than object files)')
     parser.add_argument('--threshold', type=int, default=10,
                         help='Minimum stack usage threshold in bytes (default: 10)')
     parser.add_argument('--no-color', action='store_true', help='Disable colored output')
@@ -1881,9 +1865,7 @@ Function Pointer Detection:
             print(f"{Colors.BOLD}{Colors.HEADER}🔍 ARM Stack Usage Analyzer - JSON Reader Mode{Colors.END}")
 
         output_format = 'json' if args.json else ('short' if args.short else 'table')
-        # Use threshold from command line (0 means show all)
-        threshold = args.threshold if args.threshold > 10 else 0  # Only filter if threshold was explicitly set
-        read_and_display_json(args.read_json, threshold, output_format)
+        read_and_display_json(args.read_json, args.threshold, output_format)
         return
 
     # Handle legacy JSON filtering mode (deprecated)
@@ -1904,6 +1886,10 @@ Function Pointer Detection:
     if not args.json and not args.short:
         print(f"{Colors.BOLD}{Colors.HEADER}🔍 ARM Stack Usage Analyzer{Colors.END}")
         print(f"{Colors.CYAN}Build directory: {args.build_dir}{Colors.END}")
+        if args.elf:
+            print(f"{Colors.GREEN}ELF file: {args.elf}{Colors.END}")
+        else:
+            print(f"{Colors.YELLOW}No --elf provided - code size statistics will be skipped{Colors.END}")
         if args.threshold != 10:
             print(f"{Colors.CYAN}Threshold: {args.threshold} bytes{Colors.END}")
         if args.no_warnings:
@@ -1926,6 +1912,10 @@ Function Pointer Detection:
     try:
         # Verification and setup phase
         obj_files = analyzer.check_prerequisites()
+
+        # Parse ELF for accurate code sizes if provided
+        if args.elf:
+            analyzer.parse_elf_code_sizes(args.elf)
 
         # Analysis workflow
         analyzer.parse_object_files(obj_files)
