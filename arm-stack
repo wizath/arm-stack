@@ -17,7 +17,7 @@ Requirements:
 Author: wizath
 GitHub: https://github.com/wizath
 License: MIT
-Version: 1.7
+Version: 1.8
 """
 
 import sys
@@ -34,7 +34,7 @@ from pathlib import Path
 from datetime import datetime
 
 # Version information
-__version__ = "1.7"
+__version__ = "1.8"
 __author__ = "wizath"
 __github__ = "https://github.com/wizath"
 
@@ -130,16 +130,317 @@ ThreadInfo = namedtuple('ThreadInfo', [
 ])
 
 
+class AnalysisData:
+    """Shared data container for analysis results between components."""
+
+    def __init__(self):
+        # Core data structures for analysis
+        self.frame_size: Dict[str, int] = {}
+        self.call_graph: Dict[str, Set[str]] = defaultdict(set)
+        self.total_cost: Dict[str, int] = {}
+        self.call_depth: Dict[str, int] = {}
+        self.visited: Dict[str, str] = {}
+        self.has_caller: Set[str] = set()
+        self.unresolved: Set[str] = set()
+
+        # Symbol resolution tables
+        self.addresses: Dict[int, str] = {}
+        self.global_name: Dict[str, str] = {}
+        self.ambiguous: Set[str] = set()
+
+        # Function pointer detection
+        self.has_function_pointer: Set[str] = set()
+        self.rtl_available: bool = False
+
+        # Code size tracking (flash usage)
+        self.code_size: Dict[str, int] = {}
+        self.elf_code_size: Dict[str, int] = {}
+        self.elf_file: Optional[str] = None
+
+        # Static allocation tracking (RAM usage)
+        self.data_size: Dict[str, int] = {}
+        self.bss_size: Dict[str, int] = {}
+        self.static_size: Dict[str, int] = {}
+        self.elf_data_size: Dict[str, int] = {}
+        self.elf_bss_size: Dict[str, int] = {}
+        self.func_static_vars: Dict[str, List[tuple]] = {}
+
+        # Heap allocation detection
+        self.has_heap_alloc: Set[str] = set()
+
+        # Git repository information
+        self.git_info: Dict[str, str] = {}
+
+        # Thread/task detection
+        self.detected_threads: List[ThreadInfo] = []
+
+
+class ObjectFileParser:
+    """Handles parsing of object files, .su files, and ELF binaries."""
+
+    def __init__(self, build_dir: Path, objdump_path: str, data: AnalysisData):
+        self.build_dir = build_dir
+        self.objdump_path = objdump_path
+        self.data = data
+        self.logger = logging.getLogger(__name__)
+
+    def find_object_files(self) -> List[str]:
+        """Locate all relevant object files in the build directory."""
+        patterns = ["**/*.o", "**/*.c.obj"]
+        obj_files = []
+
+        for pattern in patterns:
+            obj_files.extend(glob.glob(str(self.build_dir / pattern), recursive=True))
+
+        filtered = [
+            f for f in obj_files
+            if "CMakeFiles/CompilerIdC" not in f
+            and "CMakeFiles/CompilerIdCXX" not in f
+        ]
+
+        self.logger.info(f"  Found {len(filtered)} object files")
+        return sorted(filtered)
+
+    def parse_disassembly(self, obj_file: str) -> None:
+        """Parse object file disassembly to extract call graph."""
+        try:
+            result = subprocess.run(
+                [self.objdump_path, "-dr", obj_file],
+                capture_output=True, text=True, check=True,
+                timeout=SUBPROCESS_TIMEOUT
+            )
+
+            current_function = None
+
+            for line in result.stdout.splitlines():
+                line = line.strip()
+
+                func_match = re.match(r'^([0-9a-fA-F]+) <(.*)>:', line)
+                if func_match:
+                    addr, name = func_match.groups()
+                    current_function = f"{name}@{obj_file}"
+                    self.data.call_graph[current_function] = set()
+
+                    if name in self.data.global_name:
+                        self.data.ambiguous.add(name)
+                    self.data.global_name[name] = current_function
+
+                    addr = addr.lstrip('0') or '0'
+                    self.data.addresses[f"{addr}@{obj_file}"] = current_function
+
+                call_match = re.search(r': R_[A-Za-z0-9_]+_CALL\s+(.+)', line)
+                if call_match and current_function:
+                    target = call_match.group(1)
+
+                    if target in HEAP_ALLOC_FUNCTIONS:
+                        self.data.has_heap_alloc.add(current_function)
+
+                    if target == ".text":
+                        target = f"@{obj_file}"
+                    elif target.startswith(".text+0x"):
+                        offset = target[9:]
+                        target = f"{offset}@{obj_file}"
+
+                    self.data.call_graph[current_function].add(target)
+
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            print(f"{Colors.RED}Error disassembling {obj_file}: {e}{Colors.END}")
+            sys.exit(1)
+
+    def parse_su_file(self, obj_file: str) -> None:
+        """Parse stack usage file to extract frame sizes."""
+        if obj_file.endswith('.o'):
+            su_file = obj_file[:-2] + '.su'
+        elif obj_file.endswith('.c.obj'):
+            su_file = obj_file[:-6] + '.c.su'
+        else:
+            return
+
+        try:
+            with open(su_file, 'r') as f:
+                for line in f:
+                    match = re.match(r'.*:(\w+)\s+(\d+)\s+(\w+)', line)
+                    if match:
+                        func_name, size, qualifier = match.groups()
+                        func_full_name = f"{func_name}@{obj_file}"
+                        self.data.frame_size[func_full_name] = int(size) + CALL_COST
+        except FileNotFoundError:
+            pass
+
+    def parse_static_sizes(self, obj_file: str) -> None:
+        """Parse object file to extract .data and .bss sizes."""
+        nm_path = self.objdump_path.replace('objdump', 'nm')
+
+        try:
+            result = subprocess.run(
+                [nm_path, '--print-size', obj_file],
+                capture_output=True, text=True, check=True,
+                timeout=SUBPROCESS_TIMEOUT
+            )
+
+            total_data = 0
+            total_bss = 0
+
+            for line in result.stdout.splitlines():
+                parts = line.strip().split()
+                if len(parts) >= 4:
+                    size_hex, sym_type, sym_name = parts[1], parts[2], parts[3]
+                    try:
+                        size = int(size_hex, 16)
+                    except ValueError:
+                        continue
+
+                    if sym_type in ('D', 'd'):
+                        total_data += size
+                        var_type = 'data'
+                    elif sym_type in ('B', 'b'):
+                        total_bss += size
+                        var_type = 'bss'
+                    else:
+                        continue
+
+                    if '.' in sym_name:
+                        func_name = sym_name.split('.')[0]
+                        var_name = sym_name.split('.', 1)[1]
+                        if func_name not in self.data.func_static_vars:
+                            self.data.func_static_vars[func_name] = []
+                        self.data.func_static_vars[func_name].append((var_name, size, var_type))
+
+            if total_data > 0:
+                self.data.data_size[obj_file] = total_data
+            if total_bss > 0:
+                self.data.bss_size[obj_file] = total_bss
+            if total_data + total_bss > 0:
+                self.data.static_size[obj_file] = total_data + total_bss
+
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+
+    def parse_elf(self, elf_file: str) -> None:
+        """Parse ELF file for accurate linked sizes."""
+        self.data.elf_file = elf_file
+        nm_path = self.objdump_path.replace('objdump', 'nm')
+
+        self.logger.info(f"Parsing ELF file: {elf_file}")
+
+        try:
+            result = subprocess.run(
+                [nm_path, '--print-size', elf_file],
+                capture_output=True, text=True, check=True,
+                timeout=SUBPROCESS_TIMEOUT
+            )
+
+            for line in result.stdout.splitlines():
+                parts = line.strip().split()
+                if len(parts) >= 4:
+                    size_hex, sym_type, name = parts[1], parts[2], parts[3]
+                    try:
+                        size = int(size_hex, 16)
+                    except ValueError:
+                        continue
+
+                    if sym_type in ('T', 't'):
+                        self.data.elf_code_size[name] = size
+                    elif sym_type in ('D', 'd'):
+                        self.data.elf_data_size[name] = size
+                    elif sym_type in ('B', 'b'):
+                        self.data.elf_bss_size[name] = size
+
+            self.logger.info(f"  Code: {len(self.data.elf_code_size)} functions")
+            self.logger.info(f"  .data: {len(self.data.elf_data_size)} symbols")
+            self.logger.info(f"  .bss: {len(self.data.elf_bss_size)} symbols")
+
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
+            self.logger.warning(f"Failed to parse ELF: {e}")
+
+
+class CallGraphAnalyzer:
+    """Handles call graph analysis and stack cost calculation."""
+
+    def __init__(self, data: AnalysisData, show_warnings: bool = True):
+        self.data = data
+        self.show_warnings = show_warnings
+        self.logger = logging.getLogger(__name__)
+
+    def resolve_symbols(self) -> None:
+        """Resolve function references across object files."""
+        for func_name, callees in list(self.data.call_graph.items()):
+            resolved_callees = set()
+
+            for callee in callees:
+                if callee.startswith('@'):
+                    resolved_callees.add(callee)
+                elif '@' in callee:
+                    addr_key = callee
+                    if addr_key in self.data.addresses:
+                        resolved_callees.add(self.data.addresses[addr_key])
+                    else:
+                        self.data.unresolved.add(callee)
+                elif callee in self.data.global_name:
+                    resolved_callees.add(self.data.global_name[callee])
+                else:
+                    self.data.unresolved.add(callee)
+
+            self.data.call_graph[func_name] = resolved_callees
+
+    def trace_call_graph(self) -> None:
+        """Calculate stack costs through DFS traversal."""
+        self.logger.info("Analyzing call graph...")
+
+        def trace(func_name: str) -> None:
+            if func_name in self.data.visited:
+                if self.data.visited[func_name] == "?":
+                    self.data.visited[func_name] = "R"
+                    self.data.total_cost[func_name] = float('inf')
+                    self.data.call_depth[func_name] = float('inf')
+                return
+
+            self.data.visited[func_name] = "?"
+
+            if func_name in self.data.has_function_pointer:
+                self.data.visited[func_name] = "P"
+                self.data.total_cost[func_name] = float('inf')
+                self.data.call_depth[func_name] = float('inf')
+                return
+
+            max_depth = 0
+            max_frame = 0
+
+            if func_name in self.data.call_graph:
+                for callee in self.data.call_graph[func_name]:
+                    self.data.has_caller.add(callee)
+                    trace(callee)
+
+                    callee_cost = self.data.total_cost.get(callee, 0)
+                    callee_depth = self.data.call_depth.get(callee, 0)
+
+                    if callee_cost == float('inf') or callee_depth == float('inf'):
+                        self.data.visited[func_name] = "U"
+                        self.data.total_cost[func_name] = float('inf')
+                        self.data.call_depth[func_name] = float('inf')
+                        return
+
+                    max_frame = max(max_frame, callee_cost)
+                    max_depth = max(max_depth, callee_depth)
+
+            self.data.call_depth[func_name] = max_depth + 1
+            self.data.total_cost[func_name] = max_frame + self.data.frame_size.get(func_name, 0)
+
+            if self.data.visited[func_name] == "?":
+                self.data.visited[func_name] = " "
+
+        for func_name in self.data.call_graph:
+            trace(func_name)
+
+
 class StackAnalyzer:
     """
-    Main analyzer class for processing ARM object files and calculating stack usage.
+    Main orchestrator for ARM stack usage analysis.
 
-    This class implements the core algorithm for:
-    - Parsing object file disassembly to build call graphs
-    - Reading stack usage information from .su files
-    - Resolving function symbols across object files
-    - Calculating total stack costs through call graph traversal
-    - Generating comprehensive analysis reports
+    Coordinates the parsing, analysis, and reporting components:
+    - ObjectFileParser: Parses object files, .su files, and ELF binaries
+    - CallGraphAnalyzer: Resolves symbols and calculates stack costs
+    - Report generation methods for various output formats
     """
 
     def __init__(
@@ -166,80 +467,46 @@ class StackAnalyzer:
         self.stack_margin = stack_margin
         self.logger = logging.getLogger(__name__)
 
-        # Core data structures for analysis
-        self.frame_size: Dict[str, int] = {}  # "func@file" -> frame size in bytes
-        self.call_graph: Dict[str, Set[str]] = defaultdict(set)  # "func@file" -> {callees}
-        self.total_cost: Dict[str, int] = {}  # "func@file" -> total stack cost
-        self.call_depth: Dict[str, int] = {}  # "func@file" -> maximum call depth
-        self.visited: Dict[str, str] = {}  # "func@file" -> traversal status
-        self.has_caller: Set[str] = set()  # Functions called by others
-        self.unresolved: Set[str] = set()  # Unresolved function references
+        # Shared data container
+        self._data = AnalysisData()
 
-        # Symbol resolution tables
-        self.addresses: Dict[int, str] = {}  # address -> "func@file"
-        self.global_name: Dict[str, str] = {}  # func_name -> "func@file"
-        self.ambiguous: Set[str] = set()  # Functions with ambiguous names
+        # Component classes
+        self._parser = ObjectFileParser(self.build_dir, objdump_path, self._data)
+        self._analyzer = CallGraphAnalyzer(self._data, show_warnings)
 
-        # Function pointer detection
-        self.has_function_pointer: Set[str] = set()  # Functions with function pointer calls
-        self.rtl_available: bool = False  # Whether RTL dumps are available
-
-        # Code size tracking (flash usage)
-        self.code_size: Dict[str, int] = {}  # "func@file" -> code size in bytes
-        self.elf_code_size: Dict[str, int] = {}  # "func_name" -> linked code size from ELF
-        self.elf_file: Optional[str] = None  # Path to ELF file for linked sizes
-
-        # Static allocation tracking (RAM usage - separate .data and .bss)
-        self.data_size: Dict[str, int] = {}  # "file.o" -> .data size in bytes
-        self.bss_size: Dict[str, int] = {}   # "file.o" -> .bss size in bytes
-        self.static_size: Dict[str, int] = {}  # "file.o" -> total static (.data + .bss)
+        # Expose data attributes for backward compatibility
+        self.frame_size = self._data.frame_size
+        self.call_graph = self._data.call_graph
+        self.total_cost = self._data.total_cost
+        self.call_depth = self._data.call_depth
+        self.visited = self._data.visited
+        self.has_caller = self._data.has_caller
+        self.unresolved = self._data.unresolved
+        self.addresses = self._data.addresses
+        self.global_name = self._data.global_name
+        self.ambiguous = self._data.ambiguous
+        self.has_function_pointer = self._data.has_function_pointer
+        self.rtl_available = self._data.rtl_available
+        self.code_size = self._data.code_size
+        self.elf_code_size = self._data.elf_code_size
+        self.elf_file = self._data.elf_file
+        self.data_size = self._data.data_size
+        self.bss_size = self._data.bss_size
+        self.static_size = self._data.static_size
 
         # ELF-based static sizes (accurate after linking)
-        self.elf_data_size: Dict[str, int] = {}  # symbol -> .data size from ELF
-        self.elf_bss_size: Dict[str, int] = {}   # symbol -> .bss size from ELF
-
-        # Per-function static variables
-        self.func_static_vars: Dict[str, List[tuple]] = {}  # "func" -> [(name, size, type)]
-
-        # Heap allocation detection
-        self.has_heap_alloc: Set[str] = set()  # Functions that call malloc/free etc.
-
-        # Git repository information
-        self.git_info: Dict[str, str] = {}  # Git hash, branch, etc.
-
-        # Thread/task detection
-        self.detected_threads: List[ThreadInfo] = []  # Detected RTOS threads
+        self.elf_data_size = self._data.elf_data_size
+        self.elf_bss_size = self._data.elf_bss_size
+        self.func_static_vars = self._data.func_static_vars
+        self.has_heap_alloc = self._data.has_heap_alloc
+        self.git_info = self._data.git_info
+        self.detected_threads = self._data.detected_threads
 
     def find_object_files(self) -> List[str]:
-        """
-        Locate all relevant object files in the build directory.
-
-        Filters out CMake compiler identification files and other non-project objects.
-
-        Returns:
-            List of object file paths
-
-        Raises:
-            FileNotFoundError: If build directory doesn't exist or no object files found
-        """
+        """Locate all relevant object files in the build directory."""
         if not self.build_dir.exists():
             raise FileNotFoundError(f"Build directory '{self.build_dir}' does not exist")
-
-        obj_files = []
-        # Support both .o and .c.obj extensions (Zephyr/CMake uses .c.obj)
-        for pattern in ["**/*.o", "**/*.c.obj"]:
-            all_files = glob.glob(str(self.build_dir / pattern), recursive=True)
-            # Filter out CMake-generated compiler test files
-            for file in all_files:
-                if not any(exclude in file for exclude in [
-                    'CompilerIdC', 'CompilerIdCXX', 'CMakeCCompilerId', 'CMakeCXXCompilerId'
-                ]):
-                    obj_files.append(file)
-
-        if not obj_files:
-            raise FileNotFoundError(f"No relevant object files (.o or .c.obj) found in '{self.build_dir}'")
-
-        return sorted(obj_files)
+        return self._parser.find_object_files()
 
     def _find_rtl_files(self, obj_files: List[str]) -> List[str]:
         """
@@ -438,31 +705,24 @@ class StackAnalyzer:
         """
         Parse all object files to extract call graph and stack usage information.
 
-        For each object file:
-        - Disassembles to find function calls and build call graph
-        - Reads corresponding .su file for stack frame sizes
-        - Analyzes RTL dumps for function pointer detection (if available)
-
         Args:
             obj_files: List of object file paths to process
         """
-        self.logger.info(f"📁 Parsing {len(obj_files)} object files...")
+        self.logger.info(f"Parsing {len(obj_files)} object files...")
 
         for i, obj_file in enumerate(obj_files, 1):
-            # Progress indicator for large projects
             if i % 50 == 0 or i == len(obj_files):
                 self.logger.debug(f"Progress: {i}/{len(obj_files)} files processed")
 
-            self._parse_disassembly(obj_file)
-            self._parse_su_file(obj_file)
+            self._parser.parse_disassembly(obj_file)
+            self._parser.parse_su_file(obj_file)
             self._parse_code_sizes(obj_file)
-            self._parse_static_sizes(obj_file)
+            self._parser.parse_static_sizes(obj_file)
 
-        # Parse RTL dumps for function pointer detection if available
-        if self.rtl_available:
+        if self._data.rtl_available:
             self._parse_rtl_files(obj_files)
 
-        self.logger.info("✓ Parsing complete")
+        self.logger.info("Parsing complete")
 
     def _parse_disassembly(self, obj_file: str) -> None:
         """
@@ -569,65 +829,8 @@ class StackAnalyzer:
         pass
 
     def parse_elf_code_sizes(self, elf_file: str) -> None:
-        """
-        Parse ELF file to extract actual linked sizes for code, .data, and .bss.
-
-        This gives accurate usage after LTO and dead code elimination.
-        Much more accurate than object file sizes.
-
-        Args:
-            elf_file: Path to linked ELF file
-        """
-        self.elf_file = elf_file
-        nm_path = self.objdump_path.replace('objdump', 'nm')
-
-        self.logger.info(f"📦 Parsing ELF file: {elf_file}")
-
-        try:
-            result = subprocess.run(
-                [nm_path, '--print-size', elf_file],
-                capture_output=True, text=True, check=True,
-                timeout=SUBPROCESS_TIMEOUT
-            )
-
-            func_count = 0
-            total_code = 0
-            total_data = 0
-            total_bss = 0
-
-            for line in result.stdout.splitlines():
-                # Format: "address size type name"
-                # Example: "08001234 00000124 T main"
-                parts = line.strip().split()
-                if len(parts) >= 4:
-                    addr, size_hex, sym_type, name = parts[0], parts[1], parts[2], parts[3]
-                    try:
-                        size = int(size_hex, 16)
-                    except ValueError:
-                        continue
-
-                    # Text (code) symbols: T (global) or t (local)
-                    if sym_type in ('T', 't'):
-                        self.elf_code_size[name] = size
-                        func_count += 1
-                        total_code += size
-                    # Initialized data (.data): D (global) or d (local)
-                    elif sym_type in ('D', 'd'):
-                        self.elf_data_size[name] = size
-                        total_data += size
-                    # Uninitialized data (.bss): B (global) or b (local)
-                    elif sym_type in ('B', 'b'):
-                        self.elf_bss_size[name] = size
-                        total_bss += size
-
-            self.logger.info(f"  ✓ Code:  {func_count} functions, {total_code/1024:.1f} KB")
-            self.logger.info(f"  ✓ .data: {len(self.elf_data_size)} symbols, {total_data/1024:.1f} KB")
-            self.logger.info(f"  ✓ .bss:  {len(self.elf_bss_size)} symbols, {total_bss/1024:.1f} KB")
-
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-            self.logger.warning(f"⚠️ Failed to parse ELF: {e}")
-        except FileNotFoundError:
-            self.logger.warning(f"⚠️ nm not found or ELF file missing")
+        """Parse ELF file for accurate linked code and static sizes."""
+        self._parser.parse_elf(elf_file)
 
     def _parse_static_sizes(self, obj_file: str) -> None:
         """
@@ -865,123 +1068,20 @@ class StackAnalyzer:
                 self.logger.warning(f"⚠️ Error reading RTL file {rtl_file}: {e}")
 
     def resolve_symbols(self) -> None:
-        """
-        Resolve function call targets using symbol tables and address mappings.
-
-        This process converts raw call targets (addresses, offsets, names) into
-        fully qualified function references that can be used for call graph analysis.
-
-        Resolution priority:
-        1. Direct address matches
-        2. Global symbol name matches
-        3. Existing call graph entries
-        4. Mark as unresolved
-        """
-        self.logger.info("🔗 Resolving symbols...")
-
-        for func_name, callees in self.call_graph.items():
-            resolved = set()
-
-            for target in callees:
-                if target in self.addresses:
-                    # Direct address match
-                    resolved.add(self.addresses[target])
-                elif target in self.global_name:
-                    # Global symbol name match
-                    resolved.add(self.global_name[target])
-                    if target in self.ambiguous and self.show_warnings:
-                        self.logger.warning(f"⚠️  Ambiguous resolution: {target}")
-                elif target in self.call_graph:
-                    # Already in call graph
-                    resolved.add(target)
-                else:
-                    # Cannot resolve - likely external library function
-                    self.unresolved.add(target)
-
-            self.call_graph[func_name] = resolved
+        """Resolve function call targets using symbol tables."""
+        self.logger.info("Resolving symbols...")
+        self._analyzer.resolve_symbols()
 
     def create_interrupt_node(self) -> None:
-        """
-        Create virtual interrupt node for interrupt service routine analysis.
-
-        This creates a synthetic "INTERRUPT" node that calls all interrupt handlers
-        (functions matching "__vector_*" pattern). This allows calculation of
-        worst-case interrupt stack usage.
-        """
-        self.call_graph["INTERRUPT"] = set()
-
-        for func_name in self.call_graph:
+        """Create virtual interrupt node for ISR analysis."""
+        self._data.call_graph["INTERRUPT"] = set()
+        for func_name in self._data.call_graph:
             if "__vector_" in func_name:
-                self.call_graph["INTERRUPT"].add(func_name)
+                self._data.call_graph["INTERRUPT"].add(func_name)
 
     def trace_call_graph(self, quiet: bool = False) -> None:
-        """
-        Traverse the call graph to calculate stack costs and call depths.
-
-        Uses depth-first traversal with memoization to compute:
-        - Total stack cost: frame size + maximum callee cost
-        - Call depth: maximum depth of any call path
-        - Recursion detection: marks recursive functions
-
-        The algorithm handles cycles by detecting when a function is revisited
-        during traversal and marking it as recursive.
-        """
-        self.logger.info("�� Analyzing call graph...")
-
-        def trace(func_name: str) -> None:
-            """Recursive traversal function with cycle detection"""
-            if func_name in self.visited:
-                if self.visited[func_name] == "?":
-                    # Cycle detected - mark as recursive with unbounded stack
-                    self.visited[func_name] = "R"
-                    self.total_cost[func_name] = float('inf')
-                    self.call_depth[func_name] = float('inf')
-                return
-
-            # Mark as currently being processed
-            self.visited[func_name] = "?"
-
-            # Check if function has function pointer calls (unbounded stack)
-            if func_name in self.has_function_pointer:
-                self.visited[func_name] = "P"  # Mark as function pointer
-                self.total_cost[func_name] = float('inf')  # Unbounded
-                self.call_depth[func_name] = float('inf')
-                return
-
-            max_depth = 0
-            max_frame = 0
-
-            # Process all callees
-            if func_name in self.call_graph:
-                for callee in self.call_graph[func_name]:
-                    self.has_caller.add(callee)
-                    trace(callee)
-
-                    callee_cost = self.total_cost.get(callee, 0)
-                    callee_depth = self.call_depth.get(callee, 0)
-
-                    # If any callee is unbounded, this function is unbounded
-                    if callee_cost == float('inf') or callee_depth == float('inf'):
-                        self.visited[func_name] = "U"  # Mark as unbounded
-                        self.total_cost[func_name] = float('inf')
-                        self.call_depth[func_name] = float('inf')
-                        return
-
-                    # Track maximum cost and depth among callees
-                    max_frame = max(max_frame, callee_cost)
-                    max_depth = max(max_depth, callee_depth)
-
-            # Calculate final values
-            self.call_depth[func_name] = max_depth + 1
-            self.total_cost[func_name] = max_frame + self.frame_size.get(func_name, 0)
-
-            # Mark as completed (if not recursive or unbounded)
-            if self.visited[func_name] == "?":
-                self.visited[func_name] = " "
-
-        # Process all functions in the call graph
-        for func_name in self.call_graph:
-            trace(func_name)
+        """Traverse the call graph to calculate stack costs."""
+        self._analyzer.trace_call_graph()
 
     def _get_code_size(self, func_full_name: str) -> int:
         """Get code size for a function, preferring ELF (linked) over object file."""
