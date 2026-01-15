@@ -17,7 +17,7 @@ Requirements:
 Author: wizath
 GitHub: https://github.com/wizath
 License: MIT
-Version: 1.11
+Version: 1.12
 """
 
 import sys
@@ -34,7 +34,7 @@ from pathlib import Path
 from datetime import datetime
 
 # Version information
-__version__ = "1.11"
+__version__ = "1.12"
 __author__ = "wizath"
 __github__ = "https://github.com/wizath"
 
@@ -168,6 +168,7 @@ class AnalysisData:
         # Memory region tracking (symbol -> section name)
         self.symbol_sections: Dict[str, str] = {}  # symbol -> section name
         self.section_sizes: Dict[str, int] = {}    # section -> total size
+        self.section_symbols: Dict[str, Dict[str, int]] = {}  # section -> {symbol: size}
 
         # Heap allocation detection
         self.has_heap_alloc: Set[str] = set()
@@ -398,9 +399,18 @@ class ObjectFileParser:
                 if '|' in line:
                     parts = [p.strip() for p in line.split('|')]
                     if len(parts) >= 7:
-                        name, section = parts[0], parts[6]
+                        name, size_str, section = parts[0], parts[4], parts[6]
                         if name and section and section != '':
                             self.data.symbol_sections[name] = section
+                            # Parse size and group by section
+                            try:
+                                size = int(size_str, 16) if size_str else 0
+                                if size > 0:
+                                    if section not in self.data.section_symbols:
+                                        self.data.section_symbols[section] = {}
+                                    self.data.section_symbols[section][name] = size
+                            except ValueError:
+                                pass
 
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
             pass
@@ -572,6 +582,7 @@ class StackAnalyzer:
         self.detected_threads = self._data.detected_threads
         self.symbol_sections = self._data.symbol_sections
         self.section_sizes = self._data.section_sizes
+        self.section_symbols = self._data.section_symbols
 
     def find_object_files(self) -> List[str]:
         """Locate all relevant object files in the build directory."""
@@ -1440,16 +1451,15 @@ class StackAnalyzer:
                 for t in self.detected_threads
             ],
             'section_sizes': self.section_sizes,
-            'bss_symbols': {
-                name: size for name, size in sorted(
-                    self.elf_bss_size.items(), key=lambda x: x[1], reverse=True
-                )[:50]  # Top 50 .bss consumers
-            } if self.elf_bss_size else {},
-            'data_symbols': {
-                name: size for name, size in sorted(
-                    self.elf_data_size.items(), key=lambda x: x[1], reverse=True
-                )[:50]  # Top 50 .data consumers
-            } if self.elf_data_size else {},
+            'symbols_by_section': {
+                section: {
+                    name: size for name, size in sorted(
+                        symbols.items(), key=lambda x: x[1], reverse=True
+                    )[:30]  # Top 30 per section
+                }
+                for section, symbols in self.section_symbols.items()
+                if sum(symbols.values()) > 0
+            } if self.section_symbols else {},
             'unresolved': sorted(list(self.unresolved))
         }
 
@@ -1693,20 +1703,28 @@ class StackAnalyzer:
 
                 print(f"\n   {'Total RAM:':<20} {Colors.YELLOW}{total_ram:>8}{Colors.END} bytes")
 
-        # Show top .bss consumers (if ELF parsed)
-        if self.elf_bss_size:
-            print(f"\n{Colors.BOLD}TOP .BSS CONSUMERS{Colors.END}")
-            print("-" * 50)
+        # Show top symbols per RAM section (if ELF parsed with section info)
+        if self.section_symbols:
+            # Filter to RAM-related sections only
+            ram_section_names = [s for s in self.section_symbols.keys()
+                                 if s not in ('.text', '.rodata', '.ARM.extab', '.ARM.exidx', '.init', '.fini')
+                                 and not s.startswith('.debug')]
 
-            sorted_bss = sorted(self.elf_bss_size.items(), key=lambda x: x[1], reverse=True)[:15]
-            for name, size in sorted_bss:
-                if size >= 100:  # Only show symbols >= 100 bytes
-                    print(f"   {name:<35} {Colors.CYAN}{size:>8}{Colors.END} bytes")
+            if ram_section_names:
+                print(f"\n{Colors.BOLD}TOP STATIC ALLOCATIONS BY SECTION{Colors.END}")
+                print("-" * 55)
 
-            tracked = sum(self.elf_bss_size.values())
-            section_bss = self.section_sizes.get('.bss', 0)
-            if section_bss > tracked:
-                print(f"\n   {Colors.YELLOW}Note: {section_bss - tracked} bytes in .bss not attributed to symbols{Colors.END}")
+                for section in sorted(ram_section_names):
+                    symbols = self.section_symbols[section]
+                    section_total = sum(symbols.values())
+                    if section_total < 100:
+                        continue
+
+                    sorted_syms = sorted(symbols.items(), key=lambda x: x[1], reverse=True)[:10]
+                    print(f"\n   {Colors.CYAN}{section}{Colors.END} ({section_total} bytes total):")
+                    for name, size in sorted_syms:
+                        if size >= 100:
+                            print(f"      {name:<40} {size:>8} bytes")
 
     def _print_unresolved(self) -> None:
         """
