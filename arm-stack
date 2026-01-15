@@ -17,7 +17,7 @@ Requirements:
 Author: wizath
 GitHub: https://github.com/wizath
 License: MIT
-Version: 1.6
+Version: 1.7
 """
 
 import sys
@@ -34,7 +34,7 @@ from pathlib import Path
 from datetime import datetime
 
 # Version information
-__version__ = "1.6"
+__version__ = "1.7"
 __author__ = "wizath"
 __github__ = "https://github.com/wizath"
 
@@ -105,8 +105,19 @@ FunctionInfo = namedtuple('FunctionInfo', [
     'is_unbounded',      # Whether function has unbounded stack usage
     'unbounded_reason',  # Reason for unbounded stack (recursion, function_pointer, etc.)
     'code_size',         # Function code size in flash (bytes)
-    'static_size'        # Static allocation size in RAM (.data + .bss per file)
+    'data_size',         # Initialized data (.data) per source file
+    'bss_size',          # Uninitialized data (.bss) per source file
+    'has_heap_alloc'     # Whether function calls malloc/free etc.
 ])
+
+# Heap allocation function patterns to detect
+HEAP_ALLOC_FUNCTIONS = {
+    'malloc', 'free', 'calloc', 'realloc',  # Standard C
+    'pvPortMalloc', 'vPortFree',             # FreeRTOS
+    'k_malloc', 'k_free',                    # Zephyr
+    'mem_malloc', 'mem_free',                # lwIP
+    'OS_MemGet', 'OS_MemPut',                # uC/OS
+}
 
 # Data structure for detected thread/task information
 ThreadInfo = namedtuple('ThreadInfo', [
@@ -178,8 +189,20 @@ class StackAnalyzer:
         self.elf_code_size: Dict[str, int] = {}  # "func_name" -> linked code size from ELF
         self.elf_file: Optional[str] = None  # Path to ELF file for linked sizes
 
-        # Static allocation tracking (RAM usage - .data + .bss per file)
-        self.static_size: Dict[str, int] = {}  # "file.o" -> static size in bytes
+        # Static allocation tracking (RAM usage - separate .data and .bss)
+        self.data_size: Dict[str, int] = {}  # "file.o" -> .data size in bytes
+        self.bss_size: Dict[str, int] = {}   # "file.o" -> .bss size in bytes
+        self.static_size: Dict[str, int] = {}  # "file.o" -> total static (.data + .bss)
+
+        # ELF-based static sizes (accurate after linking)
+        self.elf_data_size: Dict[str, int] = {}  # symbol -> .data size from ELF
+        self.elf_bss_size: Dict[str, int] = {}   # symbol -> .bss size from ELF
+
+        # Per-function static variables
+        self.func_static_vars: Dict[str, List[tuple]] = {}  # "func" -> [(name, size, type)]
+
+        # Heap allocation detection
+        self.has_heap_alloc: Set[str] = set()  # Functions that call malloc/free etc.
 
         # Git repository information
         self.git_info: Dict[str, str] = {}  # Git hash, branch, etc.
@@ -487,6 +510,10 @@ class StackAnalyzer:
                 if call_match and current_function:
                     target = call_match.group(1)
 
+                    # Detect heap allocation function calls
+                    if target in HEAP_ALLOC_FUNCTIONS:
+                        self.has_heap_alloc.add(current_function)
+
                     # Handle different call target formats
                     if target == ".text":
                         target = f"@{obj_file}"
@@ -543,9 +570,9 @@ class StackAnalyzer:
 
     def parse_elf_code_sizes(self, elf_file: str) -> None:
         """
-        Parse ELF file to extract actual linked function code sizes.
+        Parse ELF file to extract actual linked sizes for code, .data, and .bss.
 
-        This gives accurate flash usage after LTO and dead code elimination.
+        This gives accurate usage after LTO and dead code elimination.
         Much more accurate than object file sizes.
 
         Args:
@@ -554,7 +581,7 @@ class StackAnalyzer:
         self.elf_file = elf_file
         nm_path = self.objdump_path.replace('objdump', 'nm')
 
-        self.logger.info(f"📦 Parsing ELF file for code sizes: {elf_file}")
+        self.logger.info(f"📦 Parsing ELF file: {elf_file}")
 
         try:
             result = subprocess.run(
@@ -564,7 +591,9 @@ class StackAnalyzer:
             )
 
             func_count = 0
-            total_size = 0
+            total_code = 0
+            total_data = 0
+            total_bss = 0
 
             for line in result.stdout.splitlines():
                 # Format: "address size type name"
@@ -572,17 +601,28 @@ class StackAnalyzer:
                 parts = line.strip().split()
                 if len(parts) >= 4:
                     addr, size_hex, sym_type, name = parts[0], parts[1], parts[2], parts[3]
-                    # Only count text (code) symbols: T (global) or t (local)
-                    if sym_type in ('T', 't'):
-                        try:
-                            size = int(size_hex, 16)
-                            self.elf_code_size[name] = size
-                            func_count += 1
-                            total_size += size
-                        except ValueError:
-                            pass
+                    try:
+                        size = int(size_hex, 16)
+                    except ValueError:
+                        continue
 
-            self.logger.info(f"  ✓ Found {func_count} functions, {total_size/1024:.1f} KB total code")
+                    # Text (code) symbols: T (global) or t (local)
+                    if sym_type in ('T', 't'):
+                        self.elf_code_size[name] = size
+                        func_count += 1
+                        total_code += size
+                    # Initialized data (.data): D (global) or d (local)
+                    elif sym_type in ('D', 'd'):
+                        self.elf_data_size[name] = size
+                        total_data += size
+                    # Uninitialized data (.bss): B (global) or b (local)
+                    elif sym_type in ('B', 'b'):
+                        self.elf_bss_size[name] = size
+                        total_bss += size
+
+            self.logger.info(f"  ✓ Code:  {func_count} functions, {total_code/1024:.1f} KB")
+            self.logger.info(f"  ✓ .data: {len(self.elf_data_size)} symbols, {total_data/1024:.1f} KB")
+            self.logger.info(f"  ✓ .bss:  {len(self.elf_bss_size)} symbols, {total_bss/1024:.1f} KB")
 
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
             self.logger.warning(f"⚠️ Failed to parse ELF: {e}")
@@ -594,7 +634,8 @@ class StackAnalyzer:
         Parse object file to extract static allocation sizes using nm.
 
         Uses arm-none-eabi-nm to get .data and .bss symbol sizes from object files.
-        This represents the static RAM footprint (global/static variables).
+        Separates initialized (.data) from uninitialized (.bss) data.
+        Also detects per-function static variables (named like func.varname).
 
         Args:
             obj_file: Object file path to analyze
@@ -608,23 +649,43 @@ class StackAnalyzer:
                 timeout=SUBPROCESS_TIMEOUT
             )
 
-            total_static = 0
+            total_data = 0
+            total_bss = 0
             for line in result.stdout.splitlines():
                 # Format: "address size type name"
                 # D/d = initialized data (.data), B/b = uninitialized data (.bss)
                 parts = line.strip().split()
                 if len(parts) >= 4:
-                    size_hex, sym_type = parts[1], parts[2]
-                    # Count data symbols: D (global data), d (local data),
-                    # B (global bss), b (local bss)
-                    if sym_type in ('D', 'd', 'B', 'b'):
-                        try:
-                            total_static += int(size_hex, 16)
-                        except ValueError:
-                            pass
+                    size_hex, sym_type, sym_name = parts[1], parts[2], parts[3]
+                    try:
+                        size = int(size_hex, 16)
+                    except ValueError:
+                        continue
 
-            if total_static > 0:
-                self.static_size[obj_file] = total_static
+                    # Separate .data (D/d) from .bss (B/b)
+                    if sym_type in ('D', 'd'):
+                        total_data += size
+                        var_type = 'data'
+                    elif sym_type in ('B', 'b'):
+                        total_bss += size
+                        var_type = 'bss'
+                    else:
+                        continue
+
+                    # Detect per-function static variables (pattern: func.varname or func.N)
+                    if '.' in sym_name:
+                        func_name = sym_name.split('.')[0]
+                        var_name = sym_name.split('.', 1)[1]
+                        if func_name not in self.func_static_vars:
+                            self.func_static_vars[func_name] = []
+                        self.func_static_vars[func_name].append((var_name, size, var_type))
+
+            if total_data > 0:
+                self.data_size[obj_file] = total_data
+            if total_bss > 0:
+                self.bss_size[obj_file] = total_bss
+            if total_data + total_bss > 0:
+                self.static_size[obj_file] = total_data + total_bss
 
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             pass
@@ -990,9 +1051,13 @@ class StackAnalyzer:
                 elif func_full_name.startswith("main@"):
                     main_cost = cost
 
-            # Get static size for this file
+            # Get static sizes for this file (separate .data and .bss)
             _, _, obj_file_path = func_full_name.partition('@')
-            file_static_size = self.static_size.get(obj_file_path, 0)
+            file_data_size = self.data_size.get(obj_file_path, 0)
+            file_bss_size = self.bss_size.get(obj_file_path, 0)
+
+            # Check if function has heap allocation calls
+            has_heap = func_full_name in self.has_heap_alloc
 
             func_info = FunctionInfo(
                 name=display_name,
@@ -1004,7 +1069,9 @@ class StackAnalyzer:
                 is_unbounded=is_unbounded,
                 unbounded_reason=unbounded_reason,
                 code_size=self._get_code_size(func_full_name),
-                static_size=file_static_size
+                data_size=file_data_size,
+                bss_size=file_bss_size,
+                has_heap_alloc=has_heap
             )
 
             functions.append(func_info)
@@ -1118,18 +1185,30 @@ class StackAnalyzer:
         if self.git_info:
             metadata['git'] = self.git_info.copy()
 
+        # Calculate RAM totals
+        total_data = sum(self.elf_data_size.values()) if self.elf_data_size else sum(self.data_size.values())
+        total_bss = sum(self.elf_bss_size.values()) if self.elf_bss_size else sum(self.bss_size.values())
+        total_static = total_data + total_bss
+        stack_peak = main_cost + max_iv_cost
+        heap_funcs = len(self.has_heap_alloc)
+
         return {
             'metadata': metadata,
             'summary': {
                 'main_cost': main_cost,
                 'max_interrupt_cost': max_iv_cost,
-                'total_peak_estimate': main_cost + max_iv_cost,
-                'max_single_function': max((f.cost for f in functions), default=0),
-                'average_stack_usage': sum(f.cost for f in functions) // len(functions) if functions else 0,
+                'total_peak_estimate': stack_peak,
+                'max_single_function': max((f.cost for f in functions if f.cost != float('inf')), default=0),
+                'average_stack_usage': sum(f.cost for f in functions if f.cost != float('inf')) // max(len([f for f in functions if f.cost != float('inf')]), 1),
                 'total_code_size': sum(self.elf_code_size.values()) if self.elf_code_size else None,
                 'max_code_size': max(self.elf_code_size.values()) if self.elf_code_size else None,
-                'total_static_size': sum(self.static_size.values()),
-                'files_with_static': len(self.static_size)
+                # RAM analysis
+                'total_data_size': total_data,
+                'total_bss_size': total_bss,
+                'total_static_size': total_static,
+                'estimated_ram_usage': stack_peak + total_static,
+                'functions_with_heap': heap_funcs,
+                'heap_usage_detected': heap_funcs > 0
             },
             'functions': [
                 {
@@ -1142,7 +1221,9 @@ class StackAnalyzer:
                     'is_unbounded': func.is_unbounded,
                     'unbounded_reason': func.unbounded_reason,
                     'code_size': func.code_size,
-                    'static_size': func.static_size
+                    'data_size': func.data_size,
+                    'bss_size': func.bss_size,
+                    'has_heap_alloc': func.has_heap_alloc
                 }
                 for func in functions if func.cost > 0 or func.is_unbounded
             ],
@@ -1158,6 +1239,19 @@ class StackAnalyzer:
                 }
                 for filename, stats in file_stats.items()
                 if stats['total_cost'] > 0
+            },
+            'ram': {
+                'data_size': total_data,
+                'bss_size': total_bss,
+                'static_total': total_static,
+                'stack_peak': stack_peak,
+                'estimated_total': stack_peak + total_static,
+                'heap_detected': heap_funcs > 0,
+                'note': 'heap size not included (dynamic)' if heap_funcs > 0 else None
+            },
+            'static_vars': {
+                func: [{'name': n, 'size': s, 'type': t} for n, s, t in vars]
+                for func, vars in self.func_static_vars.items()
             },
             'threads': [
                 {
@@ -1224,7 +1318,7 @@ class StackAnalyzer:
         print(f"{Colors.CYAN}{frame_msg}{Colors.END}")
         flash_msg = "   Flash = Code size, Static = .data+.bss per source file"
         print(f"{Colors.CYAN}{flash_msg}{Colors.END}")
-        symbols_msg = "   Symbols: ▶=Root, 🔄=Recursive, ⚠=Function pointer, ❌=Unbounded"
+        symbols_msg = "   Symbols: ▶=Root, 🔄=Recursive, ⚠=Function pointer, ❌=Unbounded, 🗑=Heap alloc"
         print(f"{Colors.CYAN}{symbols_msg}{Colors.END}\n")
 
         # Table header with proper alignment
@@ -1274,6 +1368,8 @@ class StackAnalyzer:
                 flag = f"{Colors.YELLOW}⚠{Colors.END}   "  # Function pointer call
             else:
                 flag = f"{Colors.RED}❌{Colors.END}  "  # Other unbounded reason
+        elif func.has_heap_alloc:
+            flag = f"{Colors.YELLOW}🗑{Colors.END}   "  # Heap allocation
         elif func.is_root:
             flag = f"{Colors.GREEN}▶{Colors.END}   "  # Root function
         else:
@@ -1297,8 +1393,9 @@ class StackAnalyzer:
         # Handle flash/code size display
         flash_display = str(func.code_size) if func.code_size > 0 else "-"
 
-        # Handle static allocation display
-        static_display = str(func.static_size) if func.static_size > 0 else "-"
+        # Handle RAM allocation display (.data + .bss for this source file)
+        total_static = func.data_size + func.bss_size
+        static_display = str(total_static) if total_static > 0 else "-"
 
         # Print formatted row with consistent alignment
         row = (f"{flag}{display_name:<40} {cost_display:<9} {func.frame_size:<7} "
@@ -1352,13 +1449,40 @@ class StackAnalyzer:
         else:
             print(f"\n💾 Flash Statistics: {Colors.YELLOW}Not available (use --elf for code sizes){Colors.END}")
 
-        # Static allocation statistics (.data + .bss)
-        if self.static_size:
-            total_static = sum(self.static_size.values())
-            print("\n🗄️  Static RAM Statistics (.data + .bss):")
-            print(f"   Files with static data: {Colors.CYAN}{len(self.static_size):>6}{Colors.END}")
-            print(f"   Total static size:      {Colors.YELLOW}{total_static:>6}{Colors.END} bytes")
-            print(f"   Largest file:           {Colors.RED}{max(self.static_size.values()):>6}{Colors.END} bytes")
+        # RAM Analysis
+        print(f"\n{Colors.BOLD}🗄️  RAM ANALYSIS{Colors.END}")
+        print("─" * 40)
+
+        # .data section (initialized data)
+        total_data = sum(self.elf_data_size.values()) if self.elf_data_size else sum(self.data_size.values())
+        # .bss section (uninitialized data)
+        total_bss = sum(self.elf_bss_size.values()) if self.elf_bss_size else sum(self.bss_size.values())
+        total_static = total_data + total_bss
+
+        print(f"   .data (initialized):    {Colors.CYAN}{total_data:>6}{Colors.END} bytes")
+        print(f"   .bss (uninitialized):   {Colors.CYAN}{total_bss:>6}{Colors.END} bytes")
+        print(f"   Static total:           {Colors.YELLOW}{total_static:>6}{Colors.END} bytes")
+        print(f"   Stack peak:             {Colors.YELLOW}{total_peak:>6}{Colors.END} bytes")
+
+        estimated_ram = total_peak + total_static
+        print(f"   {Colors.BOLD}Estimated RAM usage:    {Colors.GREEN}{estimated_ram:>6}{Colors.END}{Colors.BOLD} bytes{Colors.END}")
+
+        # Heap allocation warning
+        if self.has_heap_alloc:
+            print(f"\n   {Colors.YELLOW}⚠️  Heap allocations detected in {len(self.has_heap_alloc)} functions:{Colors.END}")
+            for i, func in enumerate(sorted(self.has_heap_alloc)):
+                if i < 5:
+                    func_name = func.split('@')[0] if '@' in func else func
+                    print(f"      • {func_name}")
+                elif i == 5:
+                    print(f"      • ... and {len(self.has_heap_alloc) - 5} more")
+                    break
+            print(f"   {Colors.YELLOW}   Heap size is dynamic and NOT included in estimate{Colors.END}")
+
+        # Per-function static variables summary
+        if self.func_static_vars:
+            total_func_static = sum(sum(s for _, s, _ in vars) for vars in self.func_static_vars.values())
+            print(f"\n   Per-function statics:   {Colors.CYAN}{total_func_static:>6}{Colors.END} bytes in {len(self.func_static_vars)} functions")
 
     def _print_unresolved(self) -> None:
         """
