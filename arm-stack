@@ -17,7 +17,7 @@ Requirements:
 Author: wizath
 GitHub: https://github.com/wizath
 License: MIT
-Version: 1.8
+Version: 1.9
 """
 
 import sys
@@ -34,7 +34,7 @@ from pathlib import Path
 from datetime import datetime
 
 # Version information
-__version__ = "1.8"
+__version__ = "1.9"
 __author__ = "wizath"
 __github__ = "https://github.com/wizath"
 
@@ -164,6 +164,11 @@ class AnalysisData:
         self.elf_data_size: Dict[str, int] = {}
         self.elf_bss_size: Dict[str, int] = {}
         self.func_static_vars: Dict[str, List[tuple]] = {}
+
+        # Memory region tracking (symbol -> section name)
+        self.symbol_sections: Dict[str, str] = {}  # symbol -> section name
+        self.section_sizes: Dict[str, int] = {}    # section -> total size
+        self.memory_regions: Dict[str, Dict] = {}  # region -> {start, size, used}
 
         # Heap allocation detection
         self.has_heap_alloc: Set[str] = set()
@@ -353,6 +358,142 @@ class ObjectFileParser:
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
             self.logger.warning(f"Failed to parse ELF: {e}")
 
+        # Also parse sections for memory region detection
+        self._parse_elf_sections(elf_file)
+
+    def _parse_elf_sections(self, elf_file: str) -> None:
+        """Parse ELF sections to detect memory regions (SRAM vs HyperRAM etc)."""
+        try:
+            # Use objdump -h to get section headers
+            result = subprocess.run(
+                [self.objdump_path, '-h', elf_file],
+                capture_output=True, text=True, check=True,
+                timeout=SUBPROCESS_TIMEOUT
+            )
+
+            for line in result.stdout.splitlines():
+                # Format: "idx name size vma lma file_off algn flags"
+                # Example: "  3 .data 00001234 20000000 08010000 00010000 2**2"
+                parts = line.split()
+                if len(parts) >= 6 and parts[0].isdigit():
+                    section_name = parts[1]
+                    try:
+                        size = int(parts[2], 16)
+                        vma = int(parts[3], 16)
+                    except ValueError:
+                        continue
+
+                    if size > 0:
+                        self.data.section_sizes[section_name] = size
+                        # Detect memory region by VMA address or section name
+                        region = self._classify_memory_region(section_name, vma)
+                        if region not in self.data.memory_regions:
+                            self.data.memory_regions[region] = {'size': 0, 'sections': []}
+                        self.data.memory_regions[region]['size'] += size
+                        self.data.memory_regions[region]['sections'].append(section_name)
+
+            # Now get symbol-to-section mapping using nm -S
+            nm_path = self.objdump_path.replace('objdump', 'nm')
+            result = subprocess.run(
+                [nm_path, '-S', '--format=sysv', elf_file],
+                capture_output=True, text=True, check=True,
+                timeout=SUBPROCESS_TIMEOUT
+            )
+
+            for line in result.stdout.splitlines():
+                # SysV format: "name |address |class|type|size|line|section"
+                if '|' in line:
+                    parts = [p.strip() for p in line.split('|')]
+                    if len(parts) >= 7:
+                        name, section = parts[0], parts[6]
+                        if name and section and section != '':
+                            self.data.symbol_sections[name] = section
+
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+
+    def _classify_memory_region(self, section_name: str, vma: int) -> str:
+        """Classify section into memory region based on name or address."""
+        section_lower = section_name.lower()
+
+        # Check section name patterns for external RAM
+        external_patterns = ['hyperram', 'sdram', 'extram', 'qspi', 'ospi', 'psram']
+        for pattern in external_patterns:
+            if pattern in section_lower:
+                return 'EXTERNAL_RAM'
+
+        # Check section name patterns for special internal regions
+        if 'ccm' in section_lower or 'ccmram' in section_lower:
+            return 'CCM_RAM'
+        if 'dtcm' in section_lower:
+            return 'DTCM'
+        if 'itcm' in section_lower:
+            return 'ITCM'
+        if 'backup' in section_lower or 'bkp' in section_lower:
+            return 'BACKUP_RAM'
+
+        # Default RAM sections
+        if section_name in ('.data', '.bss', '.noinit'):
+            return 'INTERNAL_SRAM'
+
+        # Check VMA for common STM32 memory regions (customize as needed)
+        # These are typical ranges, may vary by MCU
+        if 0x20000000 <= vma < 0x20100000:
+            return 'INTERNAL_SRAM'
+        if 0x10000000 <= vma < 0x10010000:
+            return 'CCM_RAM'
+        if 0x90000000 <= vma < 0xA0000000:
+            return 'EXTERNAL_RAM'  # Common HyperRAM/QSPI range
+
+        # Flash sections
+        if section_name in ('.text', '.rodata'):
+            return 'FLASH'
+        if 0x08000000 <= vma < 0x08200000:
+            return 'FLASH'
+
+        return 'OTHER'
+
+    def parse_map_file(self, map_file: str) -> None:
+        """Parse linker map file for detailed memory region info."""
+        self.logger.info(f"Parsing map file: {map_file}")
+
+        try:
+            with open(map_file, 'r') as f:
+                content = f.read()
+
+            # Parse memory configuration section
+            in_memory_config = False
+            for line in content.splitlines():
+                if 'Memory Configuration' in line:
+                    in_memory_config = True
+                    continue
+                if in_memory_config:
+                    if line.strip() == '' or 'Linker script' in line:
+                        in_memory_config = False
+                        continue
+                    # Format: "NAME ORIGIN LENGTH ATTRIBUTES"
+                    parts = line.split()
+                    if len(parts) >= 3 and parts[0] not in ('Name', '*default*'):
+                        name = parts[0]
+                        try:
+                            origin = int(parts[1], 16) if parts[1].startswith('0x') else int(parts[1])
+                            length = int(parts[2], 16) if parts[2].startswith('0x') else int(parts[2])
+                            self.data.memory_regions[name] = {
+                                'origin': origin,
+                                'length': length,
+                                'size': 0,
+                                'sections': []
+                            }
+                        except ValueError:
+                            pass
+
+            self.logger.info(f"  Found {len(self.data.memory_regions)} memory regions")
+
+        except FileNotFoundError:
+            self.logger.warning(f"Map file not found: {map_file}")
+        except Exception as e:
+            self.logger.warning(f"Failed to parse map file: {e}")
+
 
 class CallGraphAnalyzer:
     """Handles call graph analysis and stack cost calculation."""
@@ -501,6 +642,9 @@ class StackAnalyzer:
         self.has_heap_alloc = self._data.has_heap_alloc
         self.git_info = self._data.git_info
         self.detected_threads = self._data.detected_threads
+        self.symbol_sections = self._data.symbol_sections
+        self.section_sizes = self._data.section_sizes
+        self.memory_regions = self._data.memory_regions
 
     def find_object_files(self) -> List[str]:
         """Locate all relevant object files in the build directory."""
@@ -831,6 +975,10 @@ class StackAnalyzer:
     def parse_elf_code_sizes(self, elf_file: str) -> None:
         """Parse ELF file for accurate linked code and static sizes."""
         self._parser.parse_elf(elf_file)
+
+    def parse_map_file(self, map_file: str) -> None:
+        """Parse linker map file for memory region details."""
+        self._parser.parse_map_file(map_file)
 
     def _parse_static_sizes(self, obj_file: str) -> None:
         """
@@ -1364,6 +1512,17 @@ class StackAnalyzer:
                 }
                 for t in self.detected_threads
             ],
+            'memory_regions': {
+                name: {
+                    'size': info.get('size', 0),
+                    'sections': info.get('sections', []),
+                    'origin': info.get('origin'),
+                    'length': info.get('length')
+                }
+                for name, info in self.memory_regions.items()
+                if info.get('size', 0) > 0
+            },
+            'section_sizes': self.section_sizes,
             'unresolved': sorted(list(self.unresolved))
         }
 
@@ -1583,6 +1742,50 @@ class StackAnalyzer:
         if self.func_static_vars:
             total_func_static = sum(sum(s for _, s, _ in vars) for vars in self.func_static_vars.values())
             print(f"\n   Per-function statics:   {Colors.CYAN}{total_func_static:>6}{Colors.END} bytes in {len(self.func_static_vars)} functions")
+
+        # Memory regions breakdown (if ELF parsed)
+        if self.memory_regions:
+            print(f"\n{Colors.BOLD}📍 MEMORY REGIONS{Colors.END}")
+            print("─" * 40)
+
+            # Sort by size descending
+            sorted_regions = sorted(
+                self.memory_regions.items(),
+                key=lambda x: x[1].get('size', 0),
+                reverse=True
+            )
+
+            internal_total = 0
+            external_total = 0
+
+            for region_name, info in sorted_regions:
+                size = info.get('size', 0)
+                if size == 0:
+                    continue
+
+                sections = info.get('sections', [])
+                sections_str = ', '.join(sections[:3])
+                if len(sections) > 3:
+                    sections_str += f", +{len(sections)-3} more"
+
+                # Color coding based on region type
+                if region_name in ('EXTERNAL_RAM', 'HYPERRAM', 'SDRAM', 'QSPI'):
+                    color = Colors.BLUE
+                    external_total += size
+                    prefix = "  [EXT]"
+                elif region_name == 'FLASH':
+                    color = Colors.CYAN
+                    prefix = "[FLASH]"
+                else:
+                    color = Colors.YELLOW
+                    internal_total += size
+                    prefix = "  [INT]"
+
+                print(f"   {prefix} {region_name:<15} {color}{size:>8}{Colors.END} bytes  ({sections_str})")
+
+            if internal_total > 0 or external_total > 0:
+                print(f"\n   Internal RAM total:     {Colors.YELLOW}{internal_total:>8}{Colors.END} bytes")
+                print(f"   External RAM total:     {Colors.BLUE}{external_total:>8}{Colors.END} bytes")
 
     def _print_unresolved(self) -> None:
         """
@@ -2010,6 +2213,8 @@ Function Pointer Detection:
     parser.add_argument('build_dir', nargs='?', help='Build directory containing object files')
     parser.add_argument('--elf', type=str, metavar='FILE',
                         help='ELF file to get actual linked code sizes (more accurate than object files)')
+    parser.add_argument('--map', type=str, metavar='FILE',
+                        help='Linker map file for detailed memory region analysis')
     parser.add_argument('--threshold', type=int, default=10,
                         help='Minimum stack usage threshold in bytes (default: 10)')
     parser.add_argument('--no-color', action='store_true', help='Disable colored output')
@@ -2140,6 +2345,10 @@ Function Pointer Detection:
         # Parse ELF for accurate code sizes if provided
         if args.elf:
             analyzer.parse_elf_code_sizes(args.elf)
+
+        # Parse linker map file for memory region details if provided
+        if args.map:
+            analyzer.parse_map_file(args.map)
 
         # Analysis workflow
         analyzer.parse_object_files(obj_files)
