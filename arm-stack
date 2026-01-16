@@ -17,7 +17,7 @@ Requirements:
 Author: wizath
 GitHub: https://github.com/wizath
 License: MIT
-Version: 1.12
+Version: 1.13
 """
 
 import sys
@@ -34,7 +34,7 @@ from pathlib import Path
 from datetime import datetime
 
 # Version information
-__version__ = "1.12"
+__version__ = "1.13"
 __author__ = "wizath"
 __github__ = "https://github.com/wizath"
 
@@ -1460,6 +1460,11 @@ class StackAnalyzer:
                 for section, symbols in self.section_symbols.items()
                 if sum(symbols.values()) > 0
             } if self.section_symbols else {},
+            'call_graph': {
+                func: sorted(list(callees))
+                for func, callees in self.call_graph.items()
+                if callees  # Only include functions that call others
+            },
             'unresolved': sorted(list(self.unresolved))
         }
 
